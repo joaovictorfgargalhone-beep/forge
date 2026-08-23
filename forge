@@ -1,0 +1,4389 @@
+#!/bin/bash
+# /usr/bin/forge - Forge - my LFS Package Manager
+
+COMMAND=$1
+PACKAGE=$2
+
+# ---- sandbox mode (no root / can't write the real system) ----
+# If Forge can't actually write to the real system paths (/etc, /var,
+# /usr -- most commonly because it isn't running as root), fall back
+# automatically to a self-contained sandbox under $HOME/.forge instead
+# of failing partway through a build. This replaces the old
+# Termux-only detection (which sniffed for Termux-specific env vars):
+# it's not about which platform you're on, it's about whether the
+# write actually works, so this also covers a regular user account
+# without sudo, a restricted container, or anything else -- not just
+# Termux. "Installed" packages under sandbox mode land under
+# $INSTALL_ROOT, a plain directory, not the real filesystem. Every
+# path is still an explicit override (env var or forge.conf) away
+# regardless of this detection: set FORGE_SANDBOX=0 to force real
+# system paths even if the detection below is wrong (e.g. some other
+# permission layer that a plain write test doesn't catch), or
+# FORGE_SANDBOX=1 to force the sandbox even when running as root.
+FORGE_SANDBOX_AUTO=0
+if [ -z "$FORGE_SANDBOX" ]; then
+	FORGE_SANDBOX_AUTO=1
+	if mkdir -p /etc/forge 2>/dev/null && [ -w /etc/forge ]; then
+		FORGE_SANDBOX=0
+	else
+		FORGE_SANDBOX=1
+	fi
+fi
+if [ "$FORGE_SANDBOX" -eq 1 ]; then
+	FORGE_HOME="${FORGE_HOME:-$HOME/.forge}"
+	if [ "$FORGE_SANDBOX_AUTO" -eq 1 ]; then
+		echo "Note: can't write to the real system (no root?) -- using a sandbox under $FORGE_HOME instead. Set FORGE_SANDBOX=0 to override." >&2
+	fi
+else
+	FORGE_HOME=""
+fi
+
+RECIPE_DIR="${RECIPE_DIR:-${FORGE_HOME:+$FORGE_HOME/recipes}}"
+RECIPE_DIR="${RECIPE_DIR:-/etc/forge/recipes}"
+LOG_DIR="${LOG_DIR:-${FORGE_HOME:+$FORGE_HOME/log}}"
+LOG_DIR="${LOG_DIR:-/var/log/forge}"
+CHECKSUM_DIR="${CHECKSUM_DIR:-${FORGE_HOME:+$FORGE_HOME/checksums}}"
+CHECKSUM_DIR="${CHECKSUM_DIR:-/etc/forge/checksums}"
+WORKDIR="${WORKDIR:-${FORGE_HOME:+$FORGE_HOME/work}}"
+WORKDIR="${WORKDIR:-/var/tmp/forge}"
+mkdir -p "$WORKDIR"
+
+# Where 'smith' actually copies installed files to at the very end
+# (instead of literally "/" -- see the cp near the end of the smith
+# case). Real machines have no reason to override this; Termux test
+# mode redirects it to a plain sandbox directory automatically.
+INSTALL_ROOT="${INSTALL_ROOT:-${FORGE_HOME:+$FORGE_HOME/root}}"
+INSTALL_ROOT="${INSTALL_ROOT:-/}"
+
+# What 'smith' cleans out of PKG_DIR (the staged install tree) right
+# after smith() finishes, before it's copied to the real filesystem or
+# cached in the repo -- see forge_clean_pkg_dir. Both are standard
+# LFS/BLFS practice and don't change runtime behavior; --no-strip /
+# --keep-la override these per-run.
+STRIP_BINARIES="${STRIP_BINARIES:-1}"
+REMOVE_LA_FILES="${REMOVE_LA_FILES:-1}"
+
+# Defaults for 'forge sketch' (see below). Overridable via
+# /etc/forge/forge.conf, in case the book restructures its URLs or you
+# want to point at a mirror or a different edition.
+LFS_BOOK_INDEX_URL="https://www.linuxfromscratch.org/lfs/view/systemd/index.html"
+BLFS_BOOK_INDEX_URL="https://www.linuxfromscratch.org/blfs/view/systemd/index.html"
+SLFS_BOOK_INDEX_URL="https://www.linuxfromscratch.org/slfs/view/dev/index.html"
+GLFS_BOOK_INDEX_URL="https://www.linuxfromscratch.org/glfs/view/dev/index.html"
+MLFS_BOOK_INDEX_URL="https://www.linuxfromscratch.org/mlfs/view/dev/index.html"
+# LFS keeps every package's actual Download/checksum info on two
+# chapter 3 pages (Packages and Patches), separate from each package's
+# own build-instructions page under chapter 5-8/9. sketch_find_book_page
+# still resolves the build page (needed for the mold()/smith() command
+# blocks), but metadata/patch extraction for the "lfs" book falls back
+# to these two pages when the build page itself has no download link.
+LFS_PACKAGES_PAGE_URL="https://www.linuxfromscratch.org/lfs/view/systemd/chapter03/packages.html"
+LFS_PATCHES_PAGE_URL="https://www.linuxfromscratch.org/lfs/view/systemd/chapter03/patches.html"
+
+# Git repo of pre-built packages (see 'forge repo' and the OPTIONS
+# recipe field, both below). REPO_DIR is a local working copy; REPO_REMOTE
+# is optional -- leave it empty to keep the repo purely local, or point
+# it at a git remote to share builds across machines (push with 'forge
+# repo push' or automatically via REPO_AUTO_PUSH). Each cached build
+# lives at REPO_DIR/<name>/<version>/<config_id>/, where config_id is a
+# hash of the recipe file's own content plus whatever OPTIONS were
+# selected for that build -- so editing a recipe or picking different
+# options is always a cache miss, never a stale hit.
+REPO_DIR="${REPO_DIR:-${FORGE_HOME:+$FORGE_HOME/repo}}"
+REPO_DIR="${REPO_DIR:-/var/cache/forge/repo}"
+REPO_REMOTE="${REPO_REMOTE:-}"
+REPO_AUTO_PUSH="${REPO_AUTO_PUSH:-0}"
+
+# GPG-sign every commit repo_store makes, and (if REPO_GPG_VERIFY=1)
+# refuse to use a cached build whose commit isn't verifiably signed --
+# see repo_store/repo_lookup. Empty REPO_GPG_KEY means "don't sign"
+# (the default): a shared REPO_REMOTE across machines you don't fully
+# trust the write access to is the main reason to turn this on.
+REPO_GPG_KEY="${REPO_GPG_KEY:-}"
+REPO_GPG_VERIFY="${REPO_GPG_VERIFY:-0}"
+
+# A plain, append-only record of every install/upgrade/removal --
+# "when did I actually put this on the system" with no rollback
+# machinery attached to it. See forge_log_history.
+HISTORY_FILE="${HISTORY_FILE:-${FORGE_HOME:+$FORGE_HOME/history.log}}"
+HISTORY_FILE="${HISTORY_FILE:-/var/log/forge/history.log}"
+
+# When a dependency cascade has independent packages at the same
+# "level" (neither depends on the other), build them concurrently
+# instead of one at a time. MAX_PARALLEL_JOBS caps how many run at
+# once regardless of how wide a level is. Set PARALLEL_DEPS=0 in
+# forge.conf to go back to strictly sequential.
+PARALLEL_DEPS="${PARALLEL_DEPS:-1}"
+MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-$(nproc 2>/dev/null || echo 2)}"
+
+# Mirrors 'sketch --source pacman|apt' fetches sync databases from
+# directly when there's no usable local one (no /var/lib/pacman/sync
+# or /var/lib/apt/lists, or the package just isn't in what's synced
+# there) -- see sketch_pacman_lookup/sketch_apt_lookup. Works even on
+# a non-Arch/non-Debian machine, since nothing here needs pacman/apt
+# themselves installed, only wget/tar/awk. PACMAN_MIRROR defaults to
+# the official geo-balanced mirror; pick a closer/pinned one in
+# forge.conf if you want. APT_SUITE is a codename ("bookworm") or a
+# rolling alias ("stable") -- either works, Debian's mirrors resolve
+# both.
+PACMAN_MIRROR="${PACMAN_MIRROR:-https://geo.mirror.pkgbuild.com}"
+PACMAN_REPOS="${PACMAN_REPOS:-core extra multilib}"
+APT_MIRROR="${APT_MIRROR:-https://deb.debian.org/debian}"
+APT_SUITE="${APT_SUITE:-stable}"
+APT_COMPONENTS="${APT_COMPONENTS:-main}"
+CONFIG_FILE="${FORGE_CONFIG_FILE:-${FORGE_HOME:+$FORGE_HOME/forge.conf}}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/forge/forge.conf}"
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+# Extra directories to prepend to PATH before mold()/smith() run, for
+# toolchains that live somewhere the auto-detection right below doesn't
+# cover. Set as a colon-separated list in forge.conf, e.g.:
+#   EXTRA_PATH="/opt/rustc/bin:/opt/something-else/bin"
+EXTRA_PATH="${EXTRA_PATH:-}"
+[ -n "$EXTRA_PATH" ] && PATH="${EXTRA_PATH}:${PATH}"
+
+# Auto-detect and prepend the common toolchain locations that 'sudo'
+# most often drops: sudo resets PATH to its own secure_path by
+# default, which typically covers /usr/bin, /bin, /usr/sbin, /sbin but
+# NOT /usr/local/bin or anything under /opt (e.g. a Rust toolchain at
+# /opt/rustc/bin) -- so 'cargo'/'rustc'/etc. quietly aren't found even
+# though they work fine outside of Forge. Only prepends directories
+# that actually exist and aren't already in PATH.
+shopt -s nullglob
+for AUTOPATH_DIR in /bin /usr/local/bin /opt/*/bin; do
+	[ -d "$AUTOPATH_DIR" ] || continue
+	case ":$PATH:" in
+		*":$AUTOPATH_DIR:"*) ;;
+		*) PATH="${AUTOPATH_DIR}:${PATH}" ;;
+	esac
+done
+shopt -u nullglob
+
+# ---- colors (pacman-style status lines) ----
+# Disabled automatically when stdout isn't a terminal (piped, redirected
+# to a log file, etc.) or when NO_COLOR is set (https://no-color.org/).
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+	C_RESET='\033[0m'
+	C_BOLD='\033[1m'
+	C_RED='\033[1;31m'
+	C_GREEN='\033[1;32m'
+	C_YELLOW='\033[1;33m'
+	C_BLUE='\033[1;34m'
+else
+	C_RESET=''; C_BOLD=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''
+fi
+
+# :: Section header (e.g. "==> Building" in other tools)
+ui_header() { printf "${C_BOLD}${C_BLUE}::${C_RESET}${C_BOLD} %s${C_RESET}\n" "$1"; }
+# [OK]   done, no problem
+ui_ok()     { printf "${C_BOLD}[${C_GREEN}OK${C_RESET}${C_BOLD}]${C_RESET} %s\n" "$1"; }
+# [FAIL] something went wrong and this step is aborting
+ui_fail()   { printf "${C_BOLD}[${C_RED}FAIL${C_RESET}${C_BOLD}]${C_RESET} %s\n" "$1"; }
+# Warning: non-fatal, continuing anyway
+ui_warn()   { printf "${C_YELLOW}Warning:${C_RESET} %s\n" "$1"; }
+# Error: fatal, this call site is expected to exit shortly after
+ui_error()  { printf "${C_RED}Error:${C_RESET} %s\n" "$1"; }
+
+# ---- i18n ----
+# Message catalogs live in separate files under /etc/forge/lang/<code>.sh
+# (e.g. /etc/forge/lang/en.sh, /etc/forge/lang/pt_BR.sh), each populating
+# the FORGE_MSG associative array with keys like "en:downloading". Ship
+# new languages by dropping in a new file there -- no need to touch this
+# script. FORGE_LANG picks which one is active: set it explicitly in
+# /etc/forge/forge.conf to override, otherwise it's guessed from the
+# system $LANG, falling back to English if nothing matches.
+declare -A FORGE_MSG
+if [ -z "$FORGE_LANG" ]; then
+	case "$LANG" in
+		pt_BR*)            FORGE_LANG="pt_BR" ;;
+		es*)                FORGE_LANG="es" ;;
+		fr*)                FORGE_LANG="fr" ;;
+		de*)                FORGE_LANG="de" ;;
+		it*)                FORGE_LANG="it" ;;
+		ru*)                FORGE_LANG="ru" ;;
+		zh_CN*|zh_Hans*)    FORGE_LANG="zh_CN" ;;
+		ja*)                FORGE_LANG="ja" ;;
+		*)                  FORGE_LANG="en" ;;
+	esac
+fi
+LANG_DIR="${LANG_DIR:-${FORGE_HOME:+$FORGE_HOME/lang}}"
+LANG_DIR="${LANG_DIR:-/etc/forge/lang}"
+[ -f "$LANG_DIR/en.sh" ] && source "$LANG_DIR/en.sh"
+[ "$FORGE_LANG" != "en" ] && [ -f "$LANG_DIR/${FORGE_LANG}.sh" ] && source "$LANG_DIR/${FORGE_LANG}.sh"
+
+# Looks up FORGE_MSG[$FORGE_LANG:$1], falling back to FORGE_MSG[en:$1],
+# falling back to the key itself if neither exists (so a missing
+# translation degrades to a visible placeholder instead of silence).
+# Remaining args are printf-substituted into the template (%s etc.).
+# Prints with no trailing newline -- use msgln for a plain line, or
+# msg_header/msg_ok/msg_fail/msg_warn/msg_error to compose with a
+# pacman-style colored prefix.
+msg() {
+	local key="$1"; shift
+	local template="${FORGE_MSG[${FORGE_LANG}:${key}]}"
+	[ -z "$template" ] && template="${FORGE_MSG[en:${key}]}"
+	[ -z "$template" ] && template="[missing message: $key]"
+	# shellcheck disable=SC2059
+	printf -- "$template" "$@"
+}
+msgln()     { msg "$@"; printf '\n'; }
+msg_header() { ui_header "$(msg "$@")"; }
+msg_ok()     { ui_ok "$(msg "$@")"; }
+msg_fail()   { ui_fail "$(msg "$@")"; }
+msg_warn()   { ui_warn "$(msg "$@")"; }
+msg_error()  { ui_error "$(msg "$@")"; }
+
+# Resolves a package name to its recipe file, searching RECIPE_DIR
+# recursively so recipes can live in subfolders (e.g. python-modules/).
+# Prints the path on stdout; prints nothing and returns 1 if not found,
+# returns 2 if the name is ambiguous (found in more than one place).
+resolve_recipe() {
+	local pkg="$1"
+	local matches
+	matches=$(find "$RECIPE_DIR" -type f -name "${pkg}.sh" 2>/dev/null)
+	local count
+	count=$(printf '%s\n' "$matches" | grep -c .)
+
+	if [ "$count" -gt 1 ]; then
+		echo "Error: multiple recipes named '${pkg}.sh' found under $RECIPE_DIR:" >&2
+		printf '%s\n' "$matches" >&2
+		return 2
+	elif [ "$count" -eq 0 ]; then
+		return 1
+	fi
+
+	printf '%s' "$matches"
+}
+
+# If ${CHECKSUM_DIR}/<pkg>.sha256sum or .md5sum exists, its content
+# (just the hash, one line) overrides SHA256SUM/MD5SUM from the recipe.
+# Keeps long hashes out of recipes, which is nicer to edit on a TTY.
+load_external_checksum() {
+	local pkg="$1"
+	if [ -f "${CHECKSUM_DIR}/${pkg}.sha256sum" ]; then
+		SHA256SUM=$(tr -d ' \t\r\n' < "${CHECKSUM_DIR}/${pkg}.sha256sum")
+	elif [ -f "${CHECKSUM_DIR}/${pkg}.md5sum" ]; then
+		MD5SUM=$(tr -d ' \t\r\n' < "${CHECKSUM_DIR}/${pkg}.md5sum")
+	fi
+}
+
+# ---- pre-built package repo ('forge repo' and 'smith' caching) ----
+# A local git working copy (optionally backed by a remote) holding
+# already-built packages, so 'smith' can skip downloading the source
+# AND mold() entirely when an exact match already exists -- see
+# resolve_options() and the REPO_HIT_TARBALL check inside 'smith'.
+
+# Creates REPO_DIR as a git repo if it isn't one yet, wires up
+# REPO_REMOTE as 'origin' if configured and not already set, and gives
+# it a local (repo-only, never --global) commit identity if the user
+# has none configured anywhere -- otherwise 'git commit' fails with no
+# useful error from inside repo_store, and the build silently isn't cached.
+repo_ensure() {
+	if [ ! -d "$REPO_DIR/.git" ]; then
+		mkdir -p "$REPO_DIR"
+		git -C "$REPO_DIR" init -q
+	fi
+	if [ -n "$REPO_REMOTE" ] && ! git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+		git -C "$REPO_DIR" remote add origin "$REPO_REMOTE"
+	fi
+	if ! git -C "$REPO_DIR" config user.email >/dev/null 2>&1; then
+		git -C "$REPO_DIR" config user.email "forge@localhost"
+		git -C "$REPO_DIR" config user.name "Forge"
+	fi
+}
+
+repo_pkg_dir() {
+	printf '%s/%s/%s/%s' "$REPO_DIR" "$1" "$2" "$3"
+}
+
+# Hashes the recipe file's own content together with the OPT_STRING
+# selected for this build, so the cache key changes whenever either
+# does. Prints a 12-hex-char id.
+repo_config_id() {
+	local recipe="$1" opt_string="$2" recipe_hash
+	recipe_hash=$(sha256sum "$recipe" | cut -d' ' -f1)
+	printf '%s:%s' "$recipe_hash" "$opt_string" | sha256sum | cut -c1-12
+}
+
+# Prints the path to the cached tarball for NAME/VERSION/CONFIG_ID on
+# stdout, or nothing (return 1) if no matching build is in the repo yet.
+# When REPO_GPG_VERIFY=1, also requires the commit that last touched
+# that path to be a verifiable GPG signature (git verify-commit) --
+# an unsigned or unverifiable entry is treated as a miss, not used.
+# Meant for a REPO_REMOTE shared with machines/people you don't fully
+# trust the write access to; irrelevant for a purely local, single-user
+# repo.
+repo_lookup() {
+	local dir
+	dir=$(repo_pkg_dir "$1" "$2" "$3")
+	[ -f "$dir/pkg.tar.xz" ] || return 1
+	if [ "$REPO_GPG_VERIFY" -eq 1 ]; then
+		local commit
+		commit=$(git -C "$REPO_DIR" log -1 --format=%H -- "${1}/${2}/${3}" 2>/dev/null)
+		if [ -z "$commit" ] || ! git -C "$REPO_DIR" verify-commit "$commit" >/dev/null 2>&1; then
+			echo "Warning: repo entry for ${1} ${2} (${3}) isn't verifiably GPG-signed -- ignoring it (REPO_GPG_VERIFY=1)." >&2
+			return 1
+		fi
+	fi
+	printf '%s/pkg.tar.xz' "$dir"
+}
+
+# Archives $4 (a freshly-built, fully-staged PKG_DIR -- same tree
+# 'smith' would otherwise cp -rvp straight into INSTALL_ROOT) into the
+# repo under NAME/VERSION/CONFIG_ID, writes an "info" file recording
+# which OPTIONS produced it, and commits (GPG-signed with REPO_GPG_KEY
+# if set). Pushes only if REPO_AUTO_PUSH=1 and a remote is configured --
+# otherwise the commit just sits locally until a manual 'forge repo push'.
+repo_store() {
+	local name="$1" version="$2" config_id="$3" pkg_dir="$4" opt_string="$5"
+	repo_ensure
+	local dir
+	dir=$(repo_pkg_dir "$name" "$version" "$config_id")
+	mkdir -p "$dir"
+	# -9e: repo storage cares about size, not speed (unlike a local
+	# build/install, this only happens once per cached config and is
+	# meant to be shared/reused, so it's worth the extra compression
+	# time).
+	if ! XZ_OPT="-9e" tar -C "$pkg_dir" -cJf "$dir/pkg.tar.xz" .; then
+		echo "Warning: failed to archive the build for the repo -- not caching this one."
+		rm -f "$dir/pkg.tar.xz"
+		return 1
+	fi
+	{
+		echo "NAME=${name}"
+		echo "VERSION=${version}"
+		echo "CONFIG_ID=${config_id}"
+		echo "OPTIONS=${opt_string}"
+		echo "BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	} > "$dir/info"
+	git -C "$REPO_DIR" add -- "${name}/${version}/${config_id}" >/dev/null 2>&1
+	if git -C "$REPO_DIR" diff --cached --quiet -- "${name}/${version}/${config_id}" 2>/dev/null; then
+		return 0
+	fi
+	local commit_args=(-q -m "${name}-${version} (${config_id})${opt_string:+ [${opt_string}]}")
+	[ -n "$REPO_GPG_KEY" ] && commit_args=("--gpg-sign=${REPO_GPG_KEY}" "${commit_args[@]}")
+	if git -C "$REPO_DIR" commit "${commit_args[@]}" >/dev/null 2>&1; then
+		echo "Cached this build in the repo: $dir${REPO_GPG_KEY:+ (signed with $REPO_GPG_KEY)}"
+	else
+		echo "Warning: build archived at $dir, but 'git commit' failed -- run 'git -C $REPO_DIR status' to see why.${REPO_GPG_KEY:+ (REPO_GPG_KEY is set -- check that key is usable: gpg --list-secret-keys $REPO_GPG_KEY)}"
+		return 1
+	fi
+	if [ "$REPO_AUTO_PUSH" -eq 1 ] && git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+		git -C "$REPO_DIR" push -q origin HEAD 2>/dev/null \
+			|| echo "Warning: commit saved locally, but pushing to the repo remote failed. Try 'forge repo push' later."
+	fi
+}
+
+# Reads the OPTIONS array from an already-sourced recipe -- entries of
+# the form "key:description:default", default being 'y' or 'n' -- and
+# resolves each to a concrete y/n choice: from --with-<key>/
+# --without-<key> in "$@" if present, else the recipe's own default
+# when running non-interactively (-y/--yes in $FORCE), else an
+# interactive prompt in the book's own "[y/N]"/"[Y/n]" style. Sets
+# OPT_<KEY> (key upper-cased, - to _) for mold()/smith() to read, and
+# leaves a sorted "key=y,key2=n" summary in OPT_STRING for the cache
+# key. A recipe with no OPTIONS array just leaves OPT_STRING empty --
+# it still gets a cache entry, keyed on the recipe's own content alone.
+# Post-install hooks: each entry is "manifest-regex::command", checked
+# in order against the manifest 'smith' just wrote (one path per line)
+# right after the files land on the real system. A pattern that
+# matches at least one installed file runs its command exactly once,
+# even if many files matched (e.g. a hundred .so's still only run
+# ldconfig once) -- and a command that would run more than once across
+# DIFFERENT matching patterns (rare, but a package could trip both a
+# .desktop and an icon rule) also only actually runs once, since
+# de-duplication is by the resolved command string, not the pattern.
+# {ROOT} is replaced with INSTALL_ROOT (trailing slash stripped) for
+# hooks that need an explicit path rather than relying on running
+# against the live filesystem directly. Override FORGE_HOOKS entirely
+# in forge.conf to add/remove/replace entries.
+FORGE_HOOKS=(
+	'share/glib-2\.0/schemas/.*\.gschema\.xml$::glib-compile-schemas {ROOT}/usr/share/glib-2.0/schemas/'
+	'share/applications/.*\.desktop$::update-desktop-database {ROOT}/usr/share/applications 2>/dev/null'
+	'share/icons/.*::gtk-update-icon-cache -qf -t {ROOT}/usr/share/icons/hicolor 2>/dev/null'
+	'share/man/.*::mandb -q {ROOT}/usr/share/man 2>/dev/null'
+	'(^|/)lib(64)?/.*\.so(\.[0-9]+)*$::ldconfig'
+	'share/mime/.*::update-mime-database {ROOT}/usr/share/mime 2>/dev/null'
+)
+
+# Runs whichever FORGE_HOOKS entries match $1 (a manifest file, one
+# installed path per line). Skips a hook entirely (with a one-line
+# note, not a warning -- this is routine on a partial BLFS system)
+# when the command it needs isn't on PATH, and warns (but doesn't fail
+# the install) if a hook that WAS found exits non-zero.
+forge_run_hooks() {
+	local manifest="$1"
+	local root="${INSTALL_ROOT%/}"
+	local entry pattern cmd_template cmd cmd_bin
+	declare -A HOOKS_RAN
+	for entry in "${FORGE_HOOKS[@]}"; do
+		pattern="${entry%%::*}"
+		cmd_template="${entry#*::}"
+		grep -qE "$pattern" "$manifest" 2>/dev/null || continue
+		cmd="${cmd_template//\{ROOT\}/$root}"
+		[ -n "${HOOKS_RAN[$cmd]:-}" ] && continue
+		HOOKS_RAN[$cmd]=1
+		cmd_bin="${cmd%% *}"
+		if ! command -v "$cmd_bin" >/dev/null 2>&1; then
+			echo "Note: skipping hook (not installed): $cmd_bin"
+			continue
+		fi
+		echo "Running hook: $cmd"
+		if ! eval "$cmd"; then
+			echo "Warning: hook failed: $cmd"
+		fi
+	done
+}
+
+# Reads the OPTIONS array from an already-sourced recipe -- entries of
+# the form "key:description:default", default being 'y' or 'n' -- and
+# resolves each to a concrete y/n choice: from --with-<key>/
+# --without-<key> in "$@" if present, else the recipe's own default
+# when running non-interactively (-y/--yes in $FORCE), else an
+# interactive prompt in the book's own "[y/N]"/"[Y/n]" style. Sets
+# OPT_<KEY> (key upper-cased, - to _) for mold()/smith() to read, and
+# leaves a sorted "key=y,key2=n" summary in OPT_STRING for the cache
+# key. A recipe with no OPTIONS array just leaves OPT_STRING empty --
+# it still gets a cache entry, keyed on the recipe's own content alone.
+resolve_options() {
+	OPT_STRING=""
+	declare -p OPTIONS >/dev/null 2>&1 || return 0
+	[ ${#OPTIONS[@]} -eq 0 ] && return 0
+
+	local entry key rest desc default var override arg value hint answer
+	local parts=()
+	for entry in "${OPTIONS[@]}"; do
+		entry="${entry%$'\r'}"
+		key="${entry%%:*}"
+		rest="${entry#*:}"
+		desc="${rest%%:*}"
+		default="${rest##*:}"
+		[ "$default" = "y" ] || default="n"
+		var="OPT_$(printf '%s' "$key" | tr 'a-z-' 'A-Z_')"
+
+		override=""
+		for arg in "$@"; do
+			[ "$arg" = "--with-${key}" ] && override="y"
+			[ "$arg" = "--without-${key}" ] && override="n"
+		done
+
+		if [ -n "$override" ]; then
+			value="$override"
+		elif [[ "$FORCE" =~ ^(-y|--yes)$ ]]; then
+			value="$default"
+		else
+			hint="y/N"; [ "$default" = "y" ] && hint="Y/n"
+			read -rp "${desc} [${hint}] " answer
+			case "$answer" in
+				[yY][eE][sS]|[yY]) value="y" ;;
+				[nN][oO]|[nN]) value="n" ;;
+				*) value="$default" ;;
+			esac
+		fi
+
+		printf -v "$var" '%s' "$value"
+		parts+=("${key}=${value}")
+	done
+
+	OPT_STRING=$(printf '%s\n' "${parts[@]}" | sort | tr '\n' ',' | sed 's/,$//')
+}
+
+# Runs right after smith() finishes staging a fresh build into $1
+# (PKG_DIR), before it's copied to the real filesystem or cached in the
+# repo. Strips debug symbols from ELF binaries/libraries and deletes
+# libtool .la files -- both standard LFS/BLFS practice: neither changes
+# runtime behavior (the .la files are only ever consulted by libtool
+# itself at link time, and Linux doesn't need them the way some other
+# Unixes do), but together they can noticeably shrink what actually
+# lands on disk, especially for packages built with debug info left in
+# by default. Skipped entirely (with a note) if 'strip'/'file' aren't
+# on PATH. Controlled by STRIP_BINARIES/REMOVE_LA_FILES (forge.conf) or
+# --no-strip/--keep-la per run.
+# Appends one line to HISTORY_FILE: an ISO-8601 UTC timestamp, the
+# action, package name, and version, tab-separated. Purely a record --
+# nothing reads this back for rollback or anything else, it's just so
+# "when did I actually install/remove this" has an answer without
+# relying on memory. Never fails the caller: a logging failure (e.g.
+# HISTORY_FILE's directory not writable) only prints a warning.
+forge_log_history() {
+	local action="$1" name="$2" version="$3"
+	mkdir -p "$(dirname "$HISTORY_FILE")" 2>/dev/null
+	if ! printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action" "$name" "$version" >> "$HISTORY_FILE" 2>/dev/null; then
+		echo "Warning: couldn't write to $HISTORY_FILE -- history not recorded for this operation."
+	fi
+}
+
+# Runs right after smith() finishes staging a fresh build into $1
+# (PKG_DIR), before it's copied to the real filesystem or cached in the
+# repo. Strips debug symbols from ELF binaries/libraries and deletes
+# libtool .la files -- both standard LFS/BLFS practice: neither changes
+# runtime behavior (the .la files are only ever consulted by libtool
+# itself at link time, and Linux doesn't need them the way some other
+# Unixes do), but together they can noticeably shrink what actually
+# lands on disk, especially for packages built with debug info left in
+# by default. Skipped entirely (with a note) if 'strip'/'file' aren't
+# on PATH. Controlled by STRIP_BINARIES/REMOVE_LA_FILES (forge.conf) or
+# --no-strip/--keep-la per run.
+forge_clean_pkg_dir() {
+	local pkg_dir="$1"
+	local before after saved f mime
+
+	if [ "$REMOVE_LA_FILES" -eq 1 ]; then
+		find "$pkg_dir" -name '*.la' -delete 2>/dev/null
+	fi
+
+	if [ "$STRIP_BINARIES" -eq 1 ]; then
+		if ! command -v strip >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
+			echo "Note: 'strip' or 'file' not found -- skipping debug-symbol stripping."
+			return 0
+		fi
+		before=$(du -sk "$pkg_dir" 2>/dev/null | cut -f1)
+		while IFS= read -r -d '' f; do
+			[ -L "$f" ] && continue
+			mime=$(file -b --mime-type "$f" 2>/dev/null)
+			case "$mime" in
+				application/x-executable|application/x-sharedlib|application/x-pie-executable)
+					strip --strip-unneeded "$f" 2>/dev/null
+					;;
+			esac
+		done < <(find "$pkg_dir" -type f \( -path '*/bin/*' -o -path '*/sbin/*' -o -path '*/lib/*' -o -path '*/lib64/*' \) -print0 2>/dev/null)
+		after=$(du -sk "$pkg_dir" 2>/dev/null | cut -f1)
+		if [ -n "$before" ] && [ -n "$after" ] && [ "$before" -gt "$after" ]; then
+			saved=$((before - after))
+			echo "Stripped debug symbols: ${saved} KiB saved."
+		fi
+	fi
+}
+
+# Best-effort automatic checksum fetch. Only works when the remote file
+# follows the common "<hash>  <filename>" bundle format (the format
+# sha256sum/md5sum themselves produce). Anything else -- a single lone
+# hash with no filename, a PGP-signed file, a binary blob -- will not
+# match and this fails safely (prints a warning, saves nothing).
+fetch_and_save_checksum() {
+	local pkg="$1" version="$2" checksum_url="$3" algo_hint="$4"
+	local tmpfile
+	tmpfile=$(mktemp)
+
+	if ! wget -q -O "$tmpfile" "$checksum_url"; then
+		echo "Warning: could not download checksum data from $checksum_url"
+		rm -f "$tmpfile"
+		return 1
+	fi
+
+	local line hash
+	line=$(grep -E "${pkg}-${version}\.(tar\.(gz|xz|bz2|zst)|tgz|tar|zip)([[:space:]]|$)" "$tmpfile" | head -n1)
+	hash=$(printf '%s' "$line" | awk '{print $1}')
+	rm -f "$tmpfile"
+
+	if [ -z "$hash" ]; then
+		echo "Warning: could not find a checksum entry for '${pkg}-${version}' at $checksum_url"
+		echo "The remote file may not use the plain hash-list format (could be PGP-signed, binary, or a single unlabeled hash)."
+		return 1
+	fi
+
+	local ext
+	if [ "$algo_hint" = "md5" ]; then
+		ext="md5sum"
+	else
+		ext="sha256sum"
+	fi
+
+	if [ "$ext" = "sha256sum" ] && ! [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
+		echo "Warning: value found ('$hash') isn't a valid 64-character SHA256 hash. Not saving."
+		return 1
+	fi
+	if [ "$ext" = "md5sum" ] && ! [[ "$hash" =~ ^[0-9a-fA-F]{32}$ ]]; then
+		echo "Warning: value found ('$hash') isn't a valid 32-character MD5 hash. Not saving."
+		return 1
+	fi
+
+	mkdir -p "$CHECKSUM_DIR"
+	echo "$hash" > "${CHECKSUM_DIR}/${pkg}.${ext}"
+	echo "Saved checksum for $pkg ($version) to ${CHECKSUM_DIR}/${pkg}.${ext}"
+	return 0
+}
+
+# Fetches VERSION_CHECK_URL and extracts the highest version number found
+# by applying VERSION_REGEX (a grep -oP pattern) against the raw HTML.
+# VERSION_REGEX should print ONLY the version string, nothing else -- use
+# \K to discard everything matched before the version, and a (?=...)
+# lookahead to discard whatever comes after it. Example, for an Apache-style
+# directory listing full of links like "gdk-pixbuf-2.42.12.tar.xz":
+#   VERSION_REGEX='gdk-pixbuf-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.xz)'
+# Prints nothing and returns 1 on fetch failure or if nothing matched.
+# Detects the archive format from a download URL by its filename suffix.
+# Prints the extension to use for the locally-saved file (e.g. "tar.gz",
+# "zip") with no leading dot; prints nothing and returns 1 if the URL
+# doesn't end in a recognized archive extension.
+forge_archive_ext() {
+	local url="$1"
+	case "$url" in
+		*.tar.gz)  echo "tar.gz" ;;
+		*.tar.xz)  echo "tar.xz" ;;
+		*.tar.bz2) echo "tar.bz2" ;;
+		*.tar.zst) echo "tar.zst" ;;
+		*.tgz)     echo "tgz" ;;
+		*.tar)     echo "tar" ;;
+		*.zip)     echo "zip" ;;
+		*.deb)     echo "deb" ;;
+		*) return 1 ;;
+	esac
+}
+
+# Extracts archive $1 into directory $2, stripping one leading path
+# component the way "tar --strip-components=1" does -- so the contents
+# of the package's top-level folder end up directly inside $2, matching
+# what mold()/smith() expect regardless of archive format. Supports the
+# tar.* family (auto-detected by tar itself) and .zip (via unzip, since
+# unzip has no native strip-components equivalent). Returns 1 on any
+# failure, including unzip being missing for a .zip archive.
+forge_extract_archive() {
+	local archive="$1" dest="$2"
+	case "$archive" in
+		*.tar.gz|*.tar.xz|*.tar.bz2|*.tar.zst|*.tgz|*.tar)
+			tar -xf "$archive" -C "$dest" --strip-components=1
+			;;
+		*.zip)
+			if ! command -v unzip > /dev/null 2>&1; then
+				echo "Error: 'unzip' is required to extract .zip archives but wasn't found on PATH." >&2
+				return 1
+			fi
+			local tmp
+			tmp=$(mktemp -d)
+			if ! unzip -q "$archive" -d "$tmp"; then
+				rm -rf "$tmp"
+				return 1
+			fi
+			local entries=()
+			while IFS= read -r -d '' entry; do
+				entries+=("$entry")
+			done < <(find "$tmp" -mindepth 1 -maxdepth 1 -print0)
+			if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+				# Single top-level folder inside the zip -- strip it,
+				# same as tar --strip-components=1.
+				cp -a "${entries[0]}/." "$dest/"
+			else
+				# Zip contents are already flat (or have several
+				# top-level entries) -- copy as-is, nothing to strip.
+				cp -a "$tmp/." "$dest/"
+			fi
+			rm -rf "$tmp"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+# Extracts a pacman binary package (.pkg.tar.zst/.xz/.gz) into $2 (a
+# staging dir, same role as PKG_DIR for a normal source build),
+# stripping pacman's own metadata (.PKGINFO, .MTREE, .BUILDINFO,
+# .INSTALL, .Changelog -- any dotfile sitting at the top level) so only
+# the real filesystem tree (usr/, etc/, ...) ends up staged. Echoes the
+# real pkgver from .PKGINFO on success (more authoritative than
+# whatever the recipe's own VERSION says, since Arch's own metadata
+# includes the pkgrel too) -- the caller should prefer this over the
+# recipe's VERSION when non-empty. Maintainer scripts (.INSTALL's
+# post_install/post_upgrade) are deliberately NOT run: most of what
+# they'd typically do (ldconfig, mandb, desktop/icon/mime caches) is
+# already covered generically by FORGE_HOOKS, and running an arbitrary
+# third-party script against a filesystem forge doesn't fully control
+# (INSTALL_ROOT may not be "/") is its own can of worms -- this prints
+# a note instead so you know to check by hand if something specific to
+# the package seems missing after install.
+forge_install_pacman_pkg() {
+	local archive="$1" pkg_dir="$2"
+	local extract_dir
+	extract_dir=$(mktemp -d)
+
+	if ! tar -xf "$archive" -C "$extract_dir" 2>/dev/null; then
+		echo "Error: failed to extract pacman package $archive" >&2
+		rm -rf "$extract_dir"
+		return 1
+	fi
+
+	local version=""
+	if [ -f "$extract_dir/.PKGINFO" ]; then
+		version=$(grep '^pkgver' "$extract_dir/.PKGINFO" | head -n1 | sed -E 's/^pkgver[[:space:]]*=[[:space:]]*//')
+	fi
+
+	if [ -f "$extract_dir/.INSTALL" ]; then
+		echo "Note: this package has a pacman .INSTALL script (post_install/post_upgrade) -- not run automatically. Check it manually if something package-specific seems missing after install." >&2
+	fi
+
+	mkdir -p "$pkg_dir"
+	local item
+	while IFS= read -r -d '' item; do
+		cp -a "$item" "$pkg_dir"/
+	done < <(find "$extract_dir" -mindepth 1 -maxdepth 1 ! -name '.*' -print0)
+
+	rm -rf "$extract_dir"
+	[ -n "$version" ] && printf '%s\n' "$version"
+}
+
+# Same idea as forge_install_pacman_pkg, but for a Debian .deb package
+# (an 'ar' archive of debian-binary + control.tar.* + data.tar.*).
+# Extracts data.tar.* (the real filesystem tree) into $2, and echoes
+# the Version: field from control.tar.*'s control file on success.
+# Needs 'ar' (part of binutils). Same reasoning as pacman for NOT
+# running the maintainer script (postinst) automatically -- prints a
+# note when one is present instead.
+forge_install_deb_pkg() {
+	local archive="$1" pkg_dir="$2"
+
+	if ! command -v ar >/dev/null 2>&1; then
+		echo "Error: 'ar' (part of binutils) is required to extract .deb packages but wasn't found on PATH." >&2
+		return 1
+	fi
+
+	local extract_dir
+	extract_dir=$(mktemp -d)
+	if ! (cd "$extract_dir" && ar x "$archive") 2>/dev/null; then
+		echo "Error: failed to extract .deb package $archive" >&2
+		rm -rf "$extract_dir"
+		return 1
+	fi
+
+	local data_tar control_tar
+	data_tar=$(find "$extract_dir" -maxdepth 1 -name 'data.tar.*' | head -n1)
+	control_tar=$(find "$extract_dir" -maxdepth 1 -name 'control.tar.*' | head -n1)
+
+	if [ -z "$data_tar" ]; then
+		echo "Error: .deb package $archive has no data.tar.* inside -- malformed?" >&2
+		rm -rf "$extract_dir"
+		return 1
+	fi
+
+	mkdir -p "$pkg_dir"
+	if ! tar -xf "$data_tar" -C "$pkg_dir"; then
+		echo "Error: failed to extract $data_tar" >&2
+		rm -rf "$extract_dir"
+		return 1
+	fi
+
+	local version=""
+	if [ -n "$control_tar" ]; then
+		local control_dir="$extract_dir/control"
+		mkdir -p "$control_dir"
+		tar -xf "$control_tar" -C "$control_dir" 2>/dev/null
+		if [ -f "$control_dir/control" ]; then
+			version=$(grep '^Version:' "$control_dir/control" | head -n1 | sed -E 's/^Version:[[:space:]]*//')
+		fi
+		if [ -f "$control_dir/postinst" ]; then
+			echo "Note: this package has a debian postinst maintainer script -- not run automatically. Check it manually if something package-specific seems missing after install." >&2
+		fi
+	fi
+
+	rm -rf "$extract_dir"
+	[ -n "$version" ] && printf '%s\n' "$version"
+}
+
+# ---- dependency resolution (cascading install) ----
+
+# Recursively resolves the full dependency tree for $1 (a package name),
+# reading each dependency's own recipe DEPS array. Populates the global
+# DEP_ORDER array in install order, ending with $1 itself. Uses
+# DEP_VISITED to memoize already-processed packages (so a diamond dep
+# is only visited once) and to detect circular dependencies. Already
+# -installed packages are treated as satisfied leaves and NOT expanded
+# further -- except $ROOT_DEP_PKG itself (the package actually being
+# smithed), which is always added to DEP_ORDER and always has its own
+# deps checked, since it might be a reinstall/upgrade that now needs
+# something new. $2 is an internal chain string, used only to build a
+# readable circular-dependency error message.
+resolve_dep_tree() {
+	local pkg="$1" chain="$2"
+
+	case "${DEP_VISITED[$pkg]:-}" in
+		done) return 0 ;;
+		visiting)
+			msg_error circular_dep "${chain} -> ${pkg}"
+			exit 1
+			;;
+	esac
+
+	if [ "$pkg" != "$ROOT_DEP_PKG" ] && [ -f "${LOG_DIR}/${pkg}.files" ]; then
+		DEP_VISITED[$pkg]="done"
+		return 0
+	fi
+
+	local recipe
+	recipe=$(resolve_recipe "$pkg" 2>/dev/null)
+	if [ -z "$recipe" ] || [ ! -f "$recipe" ]; then
+		msg_error dep_recipe_not_found "$pkg" "${chain:-$pkg}"
+		exit 1
+	fi
+
+	DEP_VISITED[$pkg]="visiting"
+
+	local pkg_deps d
+	pkg_deps=$(DEPS=(); source "$recipe" > /dev/null 2>&1; printf '%s ' "${DEPS[@]}")
+	DEP_DIRECT_DEPS[$pkg]="$pkg_deps"
+	for d in $pkg_deps; do
+		d="${d%$'\r'}"
+		[ -z "$d" ] && continue
+		resolve_dep_tree "$d" "${chain:+$chain -> }${pkg}"
+	done
+
+	DEP_VISITED[$pkg]="done"
+	DEP_ORDER+=("$pkg")
+}
+
+# Prints (one per line) every installed package whose manifest says
+# REASON=dependency and that no other still-installed, still-wanted
+# package's DEPS array references anymore -- pacman's -Qdt equivalent.
+# Iterates to a fixed point rather than a single pass: once a package
+# is identified as orphaned, its OWN DEPS stop counting as "still
+# needed" in the next pass, so a chain (A installed explicitly depended
+# on B depended on C; A gets removed) correctly orphans both B and C,
+# not just B. Best-effort: a package whose recipe no longer exists in
+# RECIPE_DIR can't have its own DEPS checked, so it can't make anything
+# else look "still needed", but it can still be reported as an orphan
+# itself if it was marked dependency.
+forge_find_orphans() {
+	local f pkg recipe pkg_deps d reason changed
+	local -a ALL_PKGS=()
+	declare -A REASON_OF STILL_NEEDED IS_ORPHAN
+
+	for f in "$LOG_DIR"/*.files; do
+		[ -f "$f" ] || continue
+		pkg=$(basename "$f" .files)
+		ALL_PKGS+=("$pkg")
+		REASON_OF[$pkg]=$(grep '^#REASON=' "$f" 2>/dev/null | cut -d= -f2)
+	done
+
+	changed=1
+	while [ "$changed" -eq 1 ]; do
+		changed=0
+		STILL_NEEDED=()
+		for pkg in "${ALL_PKGS[@]}"; do
+			[ -n "${IS_ORPHAN[$pkg]:-}" ] && continue
+			recipe=$(resolve_recipe "$pkg" 2>/dev/null)
+			[ -n "$recipe" ] && [ -f "$recipe" ] || continue
+			pkg_deps=$(DEPS=(); source "$recipe" >/dev/null 2>&1; printf '%s\n' "${DEPS[@]}")
+			while IFS= read -r d; do
+				d="${d%$'\r'}"
+				[ -n "$d" ] && STILL_NEEDED[$d]=1
+			done <<< "$pkg_deps"
+		done
+
+		for pkg in "${ALL_PKGS[@]}"; do
+			[ -n "${IS_ORPHAN[$pkg]:-}" ] && continue
+			[ "${REASON_OF[$pkg]}" = "dependency" ] || continue
+			if [ -z "${STILL_NEEDED[$pkg]:-}" ]; then
+				IS_ORPHAN[$pkg]=1
+				changed=1
+			fi
+		done
+	done
+
+	for pkg in "${ALL_PKGS[@]}"; do
+		[ -n "${IS_ORPHAN[$pkg]:-}" ] && echo "$pkg"
+	done
+}
+
+# ---- build progress filter (bottom status bar + condensed output) ----
+
+# Sits at the end of a pipe after "| tee $BUILD_LOG" (so the log file
+# still gets everything, unfiltered) and rewrites what actually reaches
+# the terminal:
+#   - ninja's own "[N/M] action" lines and CMake-generated make's own
+#     "[ XX%] action" lines are left as-is (they're already concise) --
+#     just used to drive the bottom status bar.
+#   - long compiler/linker invocation lines (the ones full of -I/-D/-l
+#     flags that make LFS builds so noisy) are condensed to a short
+#     "  CC  file.c" / "  LD  target" line instead.
+#   - everything else -- including plain recipes that just echo their
+#     own status, or short one-off commands -- passes through
+#     unchanged, so custom mold()/smith() output is never hidden.
+# Only activates its terminal control (the bottom bar, cursor save/
+# restore) when stdout is a real terminal; otherwise it still does the
+# line condensing but skips anything that would corrupt a log file or
+# a pipe. $1 is a fallback phase label (e.g. "Building") shown on the
+# bar before the first recognized progress line arrives.
+forge_progress_filter() {
+	local phase_label="$1"
+	local is_tty=0
+	[ -t 1 ] && is_tty=1
+
+	local script
+	script=$(mktemp)
+	cat > "$script" << 'PYEOF'
+import sys, re, os, signal, shutil
+
+is_tty = sys.argv[1] == "1"
+phase_label = sys.argv[2] if len(sys.argv) > 2 else ""
+
+ninja_re = re.compile(r'^\[(\d+)/(\d+)\]\s*(.*)$')
+cmake_re = re.compile(r'^\[\s*(\d+)%\]\s*(.*)$')
+compile_re = re.compile(r'(?:^|/)(gcc|cc|g\+\+|c\+\+|clang|clang\+\+)\b.*\s-c\s')
+link_re = re.compile(r'(?:^|/)(ld|libtool)\b')
+objfile_re = re.compile(r'\.o\b')
+srcfile_re = re.compile(r'(\S+\.(?:c|cc|cpp|cxx|m|mm))(?:\s|$)')
+outfile_re = re.compile(r'-o\s+(\S+)')
+
+restored = False
+
+def term_size():
+    try:
+        c, r = shutil.get_terminal_size()
+        return r, c
+    except OSError:
+        return 24, 80
+
+def bar_start():
+    if not is_tty:
+        return
+    rows, _ = term_size()
+    sys.stdout.write(f"\x1b[1;{rows-1}r")   # reserve the bottom line
+    sys.stdout.write("\x1b7")               # save cursor (DECSC)
+    sys.stdout.flush()
+
+def bar_restore():
+    global restored
+    if not is_tty or restored:
+        return
+    restored = True
+    rows, _ = term_size()
+    sys.stdout.write(f"\x1b[1;{rows}r")     # give the full screen back
+    sys.stdout.write("\x1b8")               # restore cursor (DECRC)
+    sys.stdout.flush()
+
+def bar_update(percent, label):
+    if not is_tty:
+        return
+    rows, cols = term_size()
+    width = 30 if cols > 50 else 10
+    if percent is not None:
+        percent = max(0, min(100, percent))
+        filled = percent * width // 100
+        pct_text = f"{percent:3d}%"
+    else:
+        filled = 0
+        pct_text = "  ? %"
+    bar = "#" * filled + "-" * (width - filled)
+    text = f" [{bar}] {pct_text} {label}"[: cols - 1]
+    sys.stdout.write("\x1b7")                    # save cursor
+    sys.stdout.write(f"\x1b[{rows};1H")          # move to bottom line
+    sys.stdout.write("\x1b[2K")                  # clear it
+    sys.stdout.write(text)
+    sys.stdout.write("\x1b8")                    # restore cursor
+    sys.stdout.flush()
+
+def handle_signal(signum, frame):
+    bar_restore()
+    sys.exit(130)
+
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
+
+bar_start()
+if phase_label:
+    bar_update(None, phase_label)
+
+try:
+    for raw in sys.stdin:
+        line = raw.rstrip("\n")
+
+        m = ninja_re.match(line)
+        if m:
+            cur, tot, rest = int(m.group(1)), int(m.group(2)), m.group(3)
+            pct = int(cur * 100 / tot) if tot else None
+            print(line)
+            bar_update(pct, rest[:60])
+            continue
+
+        m = cmake_re.match(line)
+        if m:
+            pct, rest = int(m.group(1)), m.group(2)
+            print(line)
+            bar_update(pct, rest[:60])
+            continue
+
+        if len(line) > 100 and compile_re.search(line):
+            srcs = srcfile_re.findall(line)
+            label = srcs[-1] if srcs else "(source)"
+            print(f"  CC      {label}")
+            bar_update(None, f"Compiling {label}"[:60])
+            continue
+
+        is_link_cmd = link_re.search(line) or (len(objfile_re.findall(line)) >= 3 and outfile_re.search(line))
+        if len(line) > 100 and is_link_cmd:
+            outs = outfile_re.findall(line)
+            label = outs[-1] if outs else "(target)"
+            print(f"  LD      {label}")
+            bar_update(None, f"Linking {label}"[:60])
+            continue
+
+        print(line)
+finally:
+    bar_restore()
+    sys.stdout.flush()
+PYEOF
+	python3 "$script" "$is_tty" "$phase_label"
+	rm -f "$script"
+}
+
+# ---- named, numbered downloads ("Get:1 <url>" style) ----
+
+# Downloads $2 (a URL) to $3 (a destination path), printing a "Get:N"
+# header line first (N being the running $GET_COUNTER, incremented on
+# every call). If $4/$5 (expected checksum + algo) are given and a
+# matching file is already cached at the destination, the download is
+# skipped entirely. Returns 1 on download failure or checksum mismatch,
+# leaving the file in place for inspection either way.
+forge_get_file() {
+	local url="$1" dest="$2" expected="$3" algo="$4"
+
+	if [ -n "$expected" ] && [ -s "$dest" ]; then
+		local cached
+		cached=$($algo "$dest" 2>/dev/null | awk '{print $1}')
+		if [ "$cached" = "$expected" ]; then
+			msgln cached_tarball "$dest"
+			return 0
+		fi
+	fi
+
+	msg_header downloading "$GET_COUNTER" "$url"
+	GET_COUNTER=$((GET_COUNTER + 1))
+	wget --progress=bar:force:noscroll -O "$dest" "$url"
+	if [ $? -ne 0 ]; then
+		msg_error download_failed "$(basename "$dest")" "$url"
+		return 1
+	fi
+	if [ ! -s "$dest" ]; then
+		msg_error download_empty "$dest"
+		msgln download_empty_hint
+		return 1
+	fi
+
+	if [ -n "$expected" ]; then
+		local got
+		got=$($algo "$dest" | awk '{print $1}')
+		if [ -z "$got" ]; then
+			msg_error checksum_compute_failed "$dest" "$algo"
+			return 1
+		fi
+		if [ "$got" != "$expected" ]; then
+			msg_error checksum_mismatch "$(basename "$dest")"
+			msgln checksum_expected "$expected"
+			msgln checksum_got "$got"
+			msgln checksum_kept "$dest"
+			return 1
+		fi
+		msg_ok checksum_ok
+	fi
+	return 0
+}
+
+probe_latest_version() {
+	local check_url="$1" regex="$2"
+	local html
+	html=$(wget -qO- "$check_url")
+	if [ -z "$html" ]; then
+		return 1
+	fi
+
+	local latest
+	latest=$(printf '%s' "$html" | grep -oP "$regex" | sort -V -u | tail -n1)
+	if [ -z "$latest" ]; then
+		return 1
+	fi
+	printf '%s' "$latest"
+}
+
+# Rewrites VERSION="..." in a recipe file to $3, keeping everything else
+# intact (a .bak of the original is kept alongside it), then invalidates
+# any cached checksum for the package and re-fetches a fresh one if the
+# recipe defines CHECKSUM_URL.
+probe_apply_update() {
+	local recipe="$1" pkg="$2" new_version="$3" checksum_url="$4" algo_hint="$5"
+
+	cp "$recipe" "${recipe}.bak"
+	sed -i "s/^VERSION=.*/VERSION=\"${new_version}\"/" "$recipe"
+	echo "Updated $recipe: VERSION -> $new_version (backup saved at ${recipe}.bak)"
+
+	rm -f "${CHECKSUM_DIR}/${pkg}.sha256sum" "${CHECKSUM_DIR}/${pkg}.md5sum"
+
+	if [ -n "$checksum_url" ]; then
+		echo "Fetching fresh checksum for $pkg $new_version..."
+		fetch_and_save_checksum "$pkg" "$new_version" "$checksum_url" "$algo_hint"
+	else
+		echo "No CHECKSUM_URL defined for $pkg; checksum will need to be set manually before smithing."
+	fi
+}
+
+# Sources a recipe and checks it for a newer upstream version. Populates
+# PROBE_RESULT_* globals when a newer version is found. Return codes:
+#   0 = up to date   1 = fetch/extract failed   2 = no VERSION_CHECK_URL
+#   3 = newer version found (see PROBE_RESULT_*)
+probe_one() {
+	local recipe="$1"
+	local pkg_name
+	pkg_name=$(basename "$recipe" .sh)
+
+	unset VERSION_CHECK_URL VERSION_REGEX VERSION URL CHECKSUM_URL CHECKSUM_ALGO_HINT
+	source "$recipe"
+	VERSION="${VERSION%$'\r'}"
+	VERSION_CHECK_URL="${VERSION_CHECK_URL%$'\r'}"
+	VERSION_REGEX="${VERSION_REGEX%$'\r'}"
+	CHECKSUM_URL="${CHECKSUM_URL%$'\r'}"
+	CHECKSUM_ALGO_HINT="${CHECKSUM_ALGO_HINT%$'\r'}"
+
+	if [ -z "$VERSION_CHECK_URL" ] || [ -z "$VERSION_REGEX" ]; then
+		echo "$pkg_name: no VERSION_CHECK_URL/VERSION_REGEX defined, skipping."
+		return 2
+	fi
+
+	local latest
+	latest=$(probe_latest_version "$VERSION_CHECK_URL" "$VERSION_REGEX")
+	if [ -z "$latest" ]; then
+		echo "$pkg_name: could not determine latest version from $VERSION_CHECK_URL"
+		return 1
+	fi
+
+	if [ "$latest" = "$VERSION" ]; then
+		echo "$pkg_name: up to date ($VERSION)"
+		return 0
+	fi
+
+	echo "$pkg_name: new version available: ${VERSION:-unknown} -> $latest"
+	PROBE_RESULT_NAME="$pkg_name"
+	PROBE_RESULT_RECIPE="$recipe"
+	PROBE_RESULT_OLD="$VERSION"
+	PROBE_RESULT_NEW="$latest"
+	PROBE_RESULT_CHECKSUM_URL="$CHECKSUM_URL"
+	PROBE_RESULT_CHECKSUM_ALGO_HINT="$CHECKSUM_ALGO_HINT"
+	return 3
+}
+
+# ---- helpers for 'forge sketch' (auto-generating recipes from the LFS/BLFS book) ----
+
+html_decode() {
+	sed -e 's/&amp;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e "s/&#39;/'/g" -e 's/&nbsp;/ /g'
+}
+
+# Resolves a possibly-relative href found on $base into an absolute URL.
+# Handles the handful of cases actually seen in the book's HTML: absolute
+# URLs, protocol-relative (//host/...), root-relative (/path), and plain
+# relative (sibling.html).
+sketch_resolve_url() {
+	local base="$1" href="$2"
+	case "$href" in
+		http://*|https://*) printf '%s' "$href" ;;
+		//*) printf '%s' "https:$href" ;;
+		/*) printf '%s%s' "$(printf '%s' "$base" | grep -oP '^[a-z]+://[^/]+')" "$href" ;;
+		*) printf '%s/%s' "$(dirname "$base")" "$href" ;;
+	esac
+}
+
+# Searches a book index/TOC page for a link whose visible text mentions
+# $pkg (case-insensitive substring match). Prints the resolved absolute
+# URL of the first match on stdout; prints nothing and returns 1 if the
+# index couldn't be fetched or nothing matched.
+# ---- interactive menu (whiptail) ----
+
+# Runs a command with the terminal cleared and control handed back to it
+# fully (so smith()'s own colors/progress bars/prompts work normally),
+# then waits for Enter before returning to the whiptail menu.
+menu_run_and_pause() {
+	clear
+	"$@"
+	echo ""
+	read -rp "Press Enter to return to the menu..." _
+}
+
+menu_browse_recipes() {
+	local items=() f n v status
+	while IFS= read -r f; do
+		[ -e "$f" ] || continue
+		n=$(basename "$f" .sh)
+		v=$(unset VERSION; source "$f" > /dev/null 2>&1; echo "${VERSION%$'\r'}")
+		if [ -f "${LOG_DIR}/${n}.files" ]; then status="installed"; else status="not installed"; fi
+		items+=("$n" "${v:-?} -- $status")
+	done < <(find "$RECIPE_DIR" -type f -name "*.sh" 2> /dev/null | sort)
+
+	if [ ${#items[@]} -eq 0 ]; then
+		whiptail --title "Forge" --msgbox "No recipes found in $RECIPE_DIR." 8 50
+		return
+	fi
+
+	local sel
+	sel=$(whiptail --title "Recipes" --menu "Select a package:" 20 70 12 "${items[@]}" 3>&1 1>&2 2>&3) || return
+	[ -z "$sel" ] && return
+	menu_recipe_actions "$sel"
+}
+
+menu_recipe_actions() {
+	local pkg="$1" action recipe
+	while true; do
+		action=$(whiptail --title "$pkg" --menu "Action for $pkg:" 15 60 4 \
+			"1" "Install / Update" \
+			"2" "Assay (validate recipe)" \
+			"3" "View recipe" \
+			"4" "Back" \
+			3>&1 1>&2 2>&3) || return
+		case "$action" in
+			1) menu_run_and_pause "$0" smith "$pkg" ;;
+			2) menu_run_and_pause "$0" assay "$pkg" ;;
+			3)
+				recipe=$(resolve_recipe "$pkg" 2> /dev/null)
+				if [ -n "$recipe" ] && [ -f "$recipe" ]; then
+					whiptail --title "$pkg" --scrolltext --textbox "$recipe" 30 100
+				fi
+				;;
+			4) return ;;
+		esac
+	done
+}
+
+menu_browse_installed() {
+	local items=() f n v
+	mkdir -p "$LOG_DIR"
+	for f in "$LOG_DIR"/*.files; do
+		[ -e "$f" ] || continue
+		n=$(basename "$f" .files)
+		v=$(head -n1 "$f" | sed -n 's/^#VERSION=//p')
+		items+=("$n" "${v:-?}")
+	done
+
+	if [ ${#items[@]} -eq 0 ]; then
+		whiptail --title "Forge" --msgbox "No packages installed yet." 8 50
+		return
+	fi
+
+	local sel
+	sel=$(whiptail --title "Installed" --menu "Select a package:" 20 70 12 "${items[@]}" 3>&1 1>&2 2>&3) || return
+	[ -z "$sel" ] && return
+	menu_installed_actions "$sel"
+}
+
+menu_installed_actions() {
+	local pkg="$1" action
+	while true; do
+		action=$(whiptail --title "$pkg" --menu "Action for $pkg:" 15 60 4 \
+			"1" "Reinstall" \
+			"2" "Remove (melt)" \
+			"3" "View installed files" \
+			"4" "Back" \
+			3>&1 1>&2 2>&3) || return
+		case "$action" in
+			1) menu_run_and_pause "$0" smith "$pkg" --force ;;
+			2)
+				if whiptail --title "$pkg" --yesno "Remove '$pkg' from the system?" 8 50; then
+					menu_run_and_pause "$0" melt "$pkg" -y
+					return
+				fi
+				;;
+			3) whiptail --title "$pkg" --scrolltext --textbox "${LOG_DIR}/${pkg}.files" 30 100 ;;
+			4) return ;;
+		esac
+	done
+}
+
+menu_check_updates() {
+	menu_run_and_pause "$0" probe --all
+}
+
+sketch_find_book_page() {
+	local index_url="$1" pkg="$2" book_label="${3:-}"
+	local html
+	html=$(wget -qO- "$index_url")
+	[ -z "$html" ] && return 1
+
+	local pairs href
+	pairs=$(printf '%s' "$html" \
+		| grep -zoP '<a[^>]+href\s*=\s*"[^"]+"[^>]*>[^<]*</a>' \
+		| sed -z 's/\n/ /g' | tr '\0' '\n' \
+		| sed -E 's/<a[^>]+href\s*=\s*"([^"]+)"[^>]*>([^<]*)<\/a>/\1\t\2/')
+	[ -z "$pairs" ] && return 1
+
+	# EXACT match only on the URL slug (the filename in href, e.g.
+	# "firefox.html" -> "firefox") -- matching on the URL instead of the
+	# link text is more consistent, since the book's displayed text
+	# varies (case, extra words, trailing version numbers like
+	# "PulseAudio-17.0") while the filename slug stays stable. This
+	# used to fall back to a substring search when the exact match
+	# missed, but that's exactly what let "gtkmm" silently resolve to
+	# "gtkmm3" (whichever slug happened to contain the input and come
+	# first) instead of telling you outright that there's no exact
+	# "gtkmm" page. On a miss, every slug that merely CONTAINS pkg is
+	# appended to the global SKETCH_SUGGESTIONS array instead, so the
+	# caller can show them as candidates for you to pick the real name
+	# from, rather than the script guessing for you.
+	local p_lower
+	p_lower=$(printf '%s' "$pkg" | tr 'A-Z' 'a-z')
+
+	local match
+	match=$(printf '%s' "$pairs" | awk -F'\t' -v p="$p_lower" '
+		{
+			href = $1
+			n = split(href, parts, "/")
+			file = parts[n]
+			sub(/\.html?(\?.*)?(#.*)?$/, "", file)
+			slug = tolower(file)
+			if (slug == p) {print; exit}
+		}')
+
+	if [ -n "$match" ]; then
+		href=$(printf '%s' "$match" | cut -f1)
+		sketch_resolve_url "$index_url" "$href"
+		return 0
+	fi
+
+	local sk_sugg
+	while IFS= read -r sk_sugg; do
+		[ -z "$sk_sugg" ] && continue
+		SKETCH_SUGGESTIONS+=("${book_label:+$book_label: }$sk_sugg")
+	done < <(printf '%s' "$pairs" | awk -F'\t' -v p="$p_lower" '
+		{
+			href = $1
+			n = split(href, parts, "/")
+			file = parts[n]
+			sub(/\.html?(\?.*)?(#.*)?$/, "", file)
+			slug = tolower(file)
+			if (index(slug, p) > 0) print slug
+		}' | sort -u)
+
+	return 1
+}
+
+# GNOME modules are just a tarball sitting under
+# download.gnome.org/sources/<pkg>/<series>/ -- no book page, no build
+# instructions, just a plain Apache directory index. Used directly via
+# --source gnome, and as the last resort in the default multi-source
+# search for anything not documented in any book. Finds the newest
+# series directory (numeric/alpha/beta-aware via `sort -V`, so an
+# unreleased alpha/beta series IS included and can outrank the latest
+# stable one -- intentional, per request, not a bug), then the newest
+# tarball inside it (.tar.xz preferred, then .tar.bz2, then .tar.gz).
+# Prints the same URL_WITH_LITERAL_${VERSION}<TAB>VERSION<TAB>ALGO<TAB>
+# CHECKSUM shape sketch_extract_metadata does -- except the directory
+# portion of the URL is left as a literal series number (NOT templated
+# with ${VERSION}), since GNOME keeps every patch release of a series
+# under the same directory; only the filename's own version segment is
+# templated, so bumping e.g. 4.16.2 -> 4.16.3 later needs no URL edit.
+sketch_gnome_lookup() {
+	local pkg="$1"
+	local base="https://download.gnome.org/sources/${pkg}/"
+	local html
+	html=$(wget -qO- "$base")
+	[ -z "$html" ] && return 1
+
+	local all_series
+	all_series=$(printf '%s' "$html" \
+		| grep -oP 'href\s*=\s*"\K[^"/]+(?=/")' \
+		| grep -E '^[0-9]+(\.[0-9a-zA-Z]+)*$' \
+		| sort -Vr)
+	[ -z "$all_series" ] && return 1
+
+	# Walk series newest-first and use the first one that actually has
+	# a tarball in it -- GNOME sometimes creates a new series directory
+	# ahead of its first actual release, which would otherwise make the
+	# newest series a dead end instead of falling through to the one
+	# before it.
+	local series series_html tarball_href="" ext=""
+	while IFS= read -r series; do
+		[ -z "$series" ] && continue
+		series_html=$(wget -qO- "${base}${series}/")
+		[ -z "$series_html" ] && continue
+		for ext in tar.xz tar.bz2 tar.gz; do
+			tarball_href=$(printf '%s' "$series_html" \
+				| grep -oP "href\s*=\s*\"\K${pkg}-[^\"]+\.${ext}(?=\")" \
+				| sort -V | tail -n1)
+			[ -n "$tarball_href" ] && break
+		done
+		[ -n "$tarball_href" ] && break
+	done <<< "$all_series"
+	[ -z "$tarball_href" ] && return 1
+
+	local version="${tarball_href#${pkg}-}"
+	version="${version%.tar.xz}"; version="${version%.tar.bz2}"; version="${version%.tar.gz}"
+	[ -z "$version" ] && return 1
+
+	local url_template="${base}${series}/${pkg}-\${VERSION}.${ext}"
+
+	local algo="" checksum="" sum_line
+	sum_line=$(wget -qO- "${base}${series}/${tarball_href}.sha256sum" 2>/dev/null | head -n1)
+	if [ -n "$sum_line" ]; then
+		checksum=$(printf '%s' "$sum_line" | awk '{print $1}')
+		[ "${#checksum}" -eq 64 ] && algo="sha256"
+	fi
+
+	printf '%s\t%s\t%s\t%s\n' "$url_template" "$version" "$algo" "$checksum"
+}
+
+# For '--url' pointing directly at a tarball instead of a documentation
+# page (any book page, and download.gnome.org's own listings, are
+# HTML -- this is for a bare link straight to the archive, e.g. a
+# GitHub release asset or any other host with no page to scrape at
+# all). Derives VERSION from the filename itself: strips a known
+# archive extension, then expects what's left to end in
+# "-<version>" (pkgname-1.2.3.tar.xz -> version 1.2.3). Templates only
+# the filename's own version segment with the literal ${VERSION}
+# token, leaving the rest of the URL (host, path, directory) exactly
+# as given -- same reasoning as sketch_gnome_lookup: nothing here
+# guarantees the surrounding path also varies with the version, so
+# only templating the part that demonstrably does is the safe default.
+# Prints the same URL_WITH_LITERAL_${VERSION}<TAB>VERSION<TAB>ALGO<TAB>
+# CHECKSUM shape sketch_extract_metadata/sketch_gnome_lookup do, or
+# nothing (and fails) if no "-<version>" suffix could be found.
+sketch_parse_tarball_url() {
+	local url="$1"
+	local filename="${url##*/}"
+	local url_dir="${url%/*}"
+
+	local base="$filename" ext=""
+	for ext in .tar.gz .tar.xz .tar.bz2 .tar.zst .tgz .txz .tbz2 .zip; do
+		case "$filename" in
+			*"$ext") base="${filename%"$ext"}"; break ;;
+		esac
+	done
+	[ "$base" = "$filename" ] && ext=""
+
+	[[ "$base" =~ ^(.+)-([0-9][0-9A-Za-z.+_]*)$ ]] || return 1
+	local version="${BASH_REMATCH[2]}"
+	local name_part="${BASH_REMATCH[1]}"
+
+	local url_template="${url_dir}/${name_part}-\${VERSION}${ext}"
+
+	local algo="" checksum="" sum_line
+	sum_line=$(wget -qO- "${url}.sha256sum" 2>/dev/null | head -n1)
+	if [ -n "$sum_line" ]; then
+		checksum=$(printf '%s' "$sum_line" | awk '{print $1}')
+		[ "${#checksum}" -eq 64 ] && algo="sha256"
+	fi
+
+	printf '%s\t%s\t%s\t%s\n' "$url_template" "$version" "$algo" "$checksum"
+}
+
+# LFS-specific fallback: unlike BLFS/SLFS/GLFS/MLFS pages, an LFS
+# package's own build-instructions page (chapter 5-8/9) has no Download
+# link or checksum -- those only live on the chapter 3 "Packages" and
+# "Patches" pages, which list every package on ONE page each. $1 is the
+# raw HTML of one of those chapter 3 pages, $2 is the package name.
+# Finds the <h2>/<h3> section for $2 (same exact-then-substring
+# matching on the heading text, minus a trailing version, as the old
+# link-text matching in sketch_find_book_page) and prints just that
+# section's HTML, so sketch_extract_metadata/_extract_patches can run
+# on it same as they would on a normal single-package page. Prints
+# nothing if no matching section with a "Download (HTTP)" line is found.
+sketch_find_lfs_download_section() {
+	local html="$1" pkg="$2"
+	local script
+	script=$(mktemp)
+	cat > "$script" << 'PYEOF'
+import sys, re, html as htmllib
+
+data = sys.stdin.read()
+pkg = sys.argv[1].strip().lower()
+
+headings = list(re.finditer(r'<h[23][^>]*>(.*?)</h[23]>', data, re.S))
+
+sections = []
+for i, hm in enumerate(headings):
+	start = hm.start()
+	end = headings[i + 1].start() if i + 1 < len(headings) else len(data)
+	text = re.sub(r'<[^>]+>', '', hm.group(1))
+	text = htmllib.unescape(text).strip()
+	section = data[start:end]
+	if not re.search(r'Download\s*\(HTTP\)', section, re.I):
+		continue
+	sections.append((text, section))
+
+def stripped(t):
+	t = t.lower().strip()
+	return re.sub(r'-[0-9][0-9.]*[a-z]?$', '', t)
+
+match = None
+for text, section in sections:
+	if stripped(text) == pkg:
+		match = section
+		break
+if match is None:
+	for text, section in sections:
+		if pkg in text.lower():
+			match = section
+			break
+
+if match:
+	sys.stdout.buffer.write(match.encode("utf-8", "surrogatepass"))
+PYEOF
+	printf '%s' "$html" | python3 "$script" "$pkg"
+	rm -f "$script"
+}
+
+# Given a book package page's raw HTML, tries to find the download link,
+# derive NAME/VERSION from the tarball filename, and pick up a checksum
+# if the page lists one nearby. Prints one tab-separated line:
+#   URL_WITH_LITERAL_${VERSION}<TAB>VERSION<TAB>ALGO<TAB>CHECKSUM
+# ALGO/CHECKSUM are empty if none was found. Returns 1 if no tarball link
+# could be identified at all.
+sketch_extract_metadata() {
+	local html="$1"
+
+	local tar_line dl_url
+	tar_line=$(printf '%s' "$html" \
+		| grep -zoP '<a[^>]+href\s*=\s*"[^"]+\.(tar\.(gz|xz|bz2)|tgz|zip)"[^>]*>' \
+		| sed -z 's/\n/ /g' | tr '\0' '\n' \
+		| grep -i 'http' | head -n1)
+	[ -z "$tar_line" ] && tar_line=$(printf '%s' "$html" \
+		| grep -zoP '<a[^>]+href\s*=\s*"[^"]+\.(tar\.(gz|xz|bz2)|tgz|zip)"[^>]*>' \
+		| sed -z 's/\n/ /g' | tr '\0' '\n' \
+		| head -n1)
+	[ -z "$tar_line" ] && return 1
+
+	dl_url=$(printf '%s' "$tar_line" | grep -oP 'href\s*=\s*"\K[^"]+')
+	[ -z "$dl_url" ] && return 1
+
+	local filename stem version url_template
+	filename=$(basename "$dl_url")
+	stem="${filename%.tar.gz}"; stem="${stem%.tar.xz}"; stem="${stem%.tar.bz2}"; stem="${stem%.tgz}"; stem="${stem%.zip}"
+
+	version=$(printf '%s' "$stem" | grep -oP '[0-9]+(\.[0-9]+)+[a-z]?' | tail -n1)
+	[ -z "$version" ] && version=$(printf '%s' "$stem" | grep -oP '[0-9]+(\.[0-9]+)*[a-z]?$')
+	[ -z "$version" ] && return 1
+
+	url_template="${dl_url//$version/\$\{VERSION\}}"
+
+	local sum_ctx sha256 md5 checksum="" algo=""
+	sum_ctx=$(printf '%s' "$html" | grep -iP -A1 -B1 '(md5|sha256)\s*sum')
+	sha256=$(printf '%s' "$sum_ctx" | grep -oP '\b[0-9a-fA-F]{64}\b' | head -n1)
+	md5=$(printf '%s' "$sum_ctx" | grep -oP '\b[0-9a-fA-F]{32}\b' | head -n1)
+	if [ -n "$sha256" ]; then
+		checksum="$sha256"; algo="sha256"
+	elif [ -n "$md5" ]; then
+		checksum="$md5"; algo="md5"
+	fi
+
+	printf '%s\t%s\t%s\t%s\n' "$url_template" "$version" "$algo" "$checksum"
+}
+
+# Finds every link ending in .patch on the book page and prints each
+# resolved absolute URL, one per line (deduplicated). The book commonly
+# lists a "Recommended patch" or similar link in the Package Information
+# box, separate from the main tarball -- this is a best-effort heuristic
+# (any .patch href on the page), not tied to a specific verified markup
+# pattern the way the tarball/checksum extraction is, since patch
+# listings vary more page to page. Prints nothing if none are found.
+# mold() commands sometimes cd into a separate build directory (common
+# with meson/cmake: "mkdir build && cd build"), but mold() and smith()
+# run as two separate pipeline stages (each "| tee ..."), so a plain cd
+# done inside mold() does NOT carry over to smith() -- it only affects
+# that subshell. This walks $1 (the mold() body text) command by
+# command, tracking cd/pushd/popd (mkdir itself is a no-op for this
+# purpose, just often paired with a cd), and prints the net relative
+# directory smith() would need to also cd into to match -- empty if
+# mold() doesn't change directory, or nets back out to where it started
+# (e.g. a "pushd doc && ... && popd" pair that cancels itself out).
+sketch_detect_build_dir() {
+	local mold_body="$1"
+	local script
+	script=$(mktemp)
+	cat > "$script" << 'PYEOF'
+import sys, posixpath
+body = sys.stdin.read()
+current = "."
+stack = []
+for cmd in body.replace("\n", " && ").split("&&"):
+    cmd = cmd.strip()
+    if not cmd:
+        continue
+    parts = cmd.split()
+    if not parts:
+        continue
+    if parts[0] == "cd" and len(parts) > 1:
+        current = posixpath.normpath(posixpath.join(current, parts[1]))
+    elif parts[0] == "pushd" and len(parts) > 1:
+        stack.append(current)
+        current = posixpath.normpath(posixpath.join(current, parts[1]))
+    elif parts[0] == "popd":
+        if stack:
+            current = stack.pop()
+if current not in (".", ""):
+    print(current)
+PYEOF
+	printf '%s' "$mold_body" | python3 "$script"
+	rm -f "$script"
+}
+
+# Splits $1 (a scraped build-command body, AFTER any install line has
+# already been pulled out into SK_SMITH_BODY) into configuration
+# commands and build commands, line by line, preserving order within
+# each. Sets SK_HEAT_BODY (new) and reassigns SK_MOLD_BODY (not
+# `local`, same convention as the rest of sketch's generation code) to
+# just what's left. A line is classified as configuration when it
+# starts with ./configure, ../configure, ./autogen.sh, cmake, qmake, or
+# `meson setup`/a bare `meson <dir>` (the pre-0.64 spelling) --
+# anything else (make, ninja, cargo, python setup.py build, etc.) stays
+# in SK_MOLD_BODY. Blank lines and comments stay wherever they already
+# were (harmless either way) by just falling through to SK_MOLD_BODY.
+sketch_split_heat_mold() {
+	local body="$1"
+	SK_HEAT_BODY=""
+	local new_mold="" line trimmed bucket="mold" in_continuation=0
+	while IFS= read -r line; do
+		if [ "$in_continuation" -eq 0 ]; then
+			trimmed="${line#"${line%%[![:space:]]*}"}"
+			if printf '%s' "$trimmed" | grep -qE '^(\./configure|\.\./configure|\./autogen\.sh|cmake[[:space:]]|qmake\b|meson[[:space:]]+setup\b|meson[[:space:]]+[A-Za-z0-9_./-]+[[:space:]]*$)'; then
+				bucket="heat"
+			else
+				bucket="mold"
+			fi
+		fi
+		# else: this line continues whatever command started the
+		# previous line (trailing backslash) -- keep the same bucket
+		# rather than reclassifying, so a wrapped multi-line
+		# ./configure --flag1 \  --flag2 stays together in heat().
+
+		if [ "$bucket" = "heat" ]; then
+			SK_HEAT_BODY+="${line}"$'\n'
+		else
+			new_mold+="${line}"$'\n'
+		fi
+
+		case "$line" in
+			*\\) in_continuation=1 ;;
+			*) in_continuation=0 ;;
+		esac
+	done <<< "$body"
+	SK_MOLD_BODY="$new_mold"
+}
+
+# Peeks inside a downloaded tarball (without extracting it) to figure
+# out what build system it uses, for recipes with no book page to
+# scrape commands from (or where scraping found nothing) -- notably
+# every package fetched via the "gnome" source, which has no page at
+# all. Only looks at TOP-LEVEL files (path with exactly one "/", i.e.
+# straight inside the tarball's single top-level directory) so a build
+# helper script buried in a subdirectory or a vendored dependency
+# doesn't get mistaken for the project's own build system. Checked in
+# this exact priority (a tarball can legitimately have more than one
+# marker file at once, e.g. an autotools project that also ships a
+# meson.build during its migration period):
+#   meson.build > configure > autogen.sh > setup.py
+# Prints one of: meson / configure / autogen / setuppy, or nothing (and
+# fails) if none of the four were found or the tarball couldn't be read.
+
+# Same priority/logic as sketch_detect_build_system, but for a
+# directory already on disk (a git clone) instead of listing inside an
+# unextracted tarball -- no point downloading+listing when the tree is
+# already sitting right there. meson.build > configure > autogen.sh >
+# setup.py, top level only.
+sketch_detect_build_system_dir() {
+	local dir="$1"
+	if [ -f "$dir/meson.build" ]; then
+		echo "meson"
+	elif [ -f "$dir/configure" ]; then
+		echo "configure"
+	elif [ -f "$dir/autogen.sh" ]; then
+		echo "autogen"
+	elif [ -f "$dir/setup.py" ]; then
+		echo "setuppy"
+	else
+		return 1
+	fi
+}
+
+# For '--source git' (a package whose released tarballs lag behind its
+# actual git history -- exactly the case that prompted this: an
+# upstream that's abandoned or slow to cut releases while the repo
+# itself has real fixes sitting on the default branch). $1 is the git
+# URL, $2 an optional explicit ref (tag/branch/commit) -- when empty,
+# picks the newest tag by `sort -V` (same alpha/beta-aware ordering as
+# sketch_gnome_lookup), falling back to the default branch HEAD if the
+# repo has no tags at all. Shallow-clones (--depth 1) at that ref into
+# a temp dir under WORKDIR and leaves it there (doesn't clean up --
+# the caller inspects it for a build system, then removes it) since a
+# second full clone during 'smith' would be wasteful when we already
+# have the tree. Prints VERSION<TAB>RESOLVED_REF<TAB>CLONE_DIR (the
+# clone dir is part of the output, not a side-effect global, since the
+# caller invokes this inside "$(...)" -- a subshell -- where a plain
+# variable assignment wouldn't survive back to the caller), or nothing
+# (and fails) if the clone itself failed.
+sketch_git_lookup() {
+	local git_url="$1" ref="$2"
+
+	if [ -z "$ref" ]; then
+		ref=$(git ls-remote --tags --refs "$git_url" 2>/dev/null \
+			| awk -F/ '{print $NF}' \
+			| sort -V | tail -n1)
+	fi
+
+	mkdir -p "$WORKDIR"
+	local clone_dir
+	clone_dir=$(mktemp -d "${WORKDIR}/.sketch-git-XXXXXX" 2>/dev/null) || return 1
+
+	local clone_args=(--depth 1)
+	[ -n "$ref" ] && clone_args+=(--branch "$ref")
+	if ! git clone --quiet "${clone_args[@]}" "$git_url" "$clone_dir" 2>/dev/null; then
+		rm -rf "$clone_dir"
+		return 1
+	fi
+
+	local version
+	if [ -n "$ref" ]; then
+		version="$ref"
+		[[ "$version" =~ ^[vV][0-9] ]] && version="${version:1}"
+	else
+		ref=$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null)
+		version=$(git -C "$clone_dir" rev-parse --short HEAD 2>/dev/null)
+	fi
+	if [ -z "$version" ]; then
+		rm -rf "$clone_dir"
+		return 1
+	fi
+
+	printf '%s\t%s\t%s\n' "$version" "$ref" "$clone_dir"
+}
+
+# Shared by sketch_pacman_lookup for both the local-sync-db and
+# freshly-downloaded-from-mirror cases: scans every *.db under $1 for
+# a %NAME% match to $2. Each *.db is a tarball of one
+# "<name>-<version>/desc" entry per package. Prints
+# VERSION<TAB>FILENAME<TAB>REPO (REPO taken from the .db's own
+# filename), or nothing (and fails) on no match.
+sketch_pacman_scan() {
+	local sync_dir="$1" pkg="$2"
+	[ -d "$sync_dir" ] || return 1
+
+	local db repo tmp desc_file name version filename
+	for db in "$sync_dir"/*.db; do
+		[ -f "$db" ] || continue
+		repo=$(basename "$db" .db)
+		tmp=$(mktemp -d)
+		if ! tar -xf "$db" -C "$tmp" 2>/dev/null; then
+			rm -rf "$tmp"
+			continue
+		fi
+		for desc_file in "$tmp"/*/desc; do
+			[ -f "$desc_file" ] || continue
+			name=$(awk '/^%NAME%$/{getline; print; exit}' "$desc_file")
+			[ "$name" = "$pkg" ] || continue
+			version=$(awk '/^%VERSION%$/{getline; print; exit}' "$desc_file")
+			filename=$(awk '/^%FILENAME%$/{getline; print; exit}' "$desc_file")
+			rm -rf "$tmp"
+			printf '%s\t%s\t%s\n' "$version" "$filename" "$repo"
+			return 0
+		done
+		rm -rf "$tmp"
+	done
+	return 1
+}
+
+# For '--source pacman' -- resolves $1 (a package name) to a download
+# URL. Tries the LOCAL sync databases first (/var/lib/pacman/sync,
+# populated by 'pacman -Sy' -- not fetched by sketch itself, so this
+# path is instant and needs no network round-trip at all). If that
+# comes up empty -- no local pacman, or the package just isn't in
+# what's currently synced -- falls back to downloading each repo's
+# *.db fresh from PACMAN_MIRROR/PACMAN_REPOS (forge.conf) into a temp
+# dir and scanning that instead, so this still works on a non-Arch
+# machine or a stale/never-synced one. Prints
+# URL<TAB>VERSION<TAB>REPO, or nothing (and fails) if the package
+# isn't found either way.
+sketch_pacman_lookup() {
+	local pkg="$1"
+	local result version filename repo
+
+	result=$(sketch_pacman_scan "/var/lib/pacman/sync" "$pkg")
+	if [ -n "$result" ]; then
+		IFS=$'\t' read -r version filename repo <<< "$result"
+		local mirror
+		mirror=$(grep -h -m1 '^Server' /etc/pacman.d/mirrorlist 2>/dev/null | sed -E 's/^Server[[:space:]]*=[[:space:]]*//')
+		if [ -n "$mirror" ]; then
+			local arch; arch=$(uname -m)
+			mirror="${mirror//\$repo/$repo}"
+			mirror="${mirror//\$arch/$arch}"
+			printf '%s\t%s\t%s\n' "${mirror%/}/${filename}" "$version" "$repo"
+			return 0
+		fi
+	fi
+
+	echo "Not found in the local sync databases (or none exist) -- checking $PACMAN_MIRROR directly..." >&2
+	local arch tmp_dir
+	arch=$(uname -m)
+	tmp_dir=$(mktemp -d)
+	for repo in $PACMAN_REPOS; do
+		wget -qO "${tmp_dir}/${repo}.db" "${PACMAN_MIRROR%/}/${repo}/os/${arch}/${repo}.db" 2>/dev/null
+	done
+	result=$(sketch_pacman_scan "$tmp_dir" "$pkg")
+	rm -rf "$tmp_dir"
+	[ -z "$result" ] && return 1
+
+	IFS=$'\t' read -r version filename repo <<< "$result"
+	printf '%s\t%s\t%s\n' "${PACMAN_MIRROR%/}/${repo}/os/${arch}/${filename}" "$version" "$repo"
+}
+
+# Shared by sketch_apt_lookup for both the local-index and
+# freshly-downloaded-from-mirror cases: scans every *Packages* file
+# under $1 (plain text or .gz) for a "Package: $2" stanza. Prints
+# VERSION<TAB>FILENAME, or nothing (and fails) on no match.
+sketch_apt_scan() {
+	local lists_dir="$1" pkg="$2"
+	[ -d "$lists_dir" ] || return 1
+
+	local pkg_file reader block version filename
+	for pkg_file in "$lists_dir"/*Packages*; do
+		[ -f "$pkg_file" ] || continue
+		case "$pkg_file" in
+			*.gz) reader="zcat" ;;
+			*.xz) reader="xzcat" ;;
+			*) reader="cat" ;;
+		esac
+		block=$("$reader" "$pkg_file" 2>/dev/null | awk -v want="$pkg" '
+			BEGIN { RS = ""; FS = "\n" }
+			{
+				name = ""; ver = ""; fn = ""
+				for (i = 1; i <= NF; i++) {
+					if ($i ~ /^Package: /) { name = $i; sub(/^Package: /, "", name) }
+					if ($i ~ /^Version: /) { ver = $i; sub(/^Version: /, "", ver) }
+					if ($i ~ /^Filename: /) { fn = $i; sub(/^Filename: /, "", fn) }
+				}
+				if (name == want) { print ver; print fn; exit }
+			}
+		')
+		[ -n "$block" ] || continue
+		version=$(printf '%s\n' "$block" | sed -n 1p)
+		filename=$(printf '%s\n' "$block" | sed -n 2p)
+		[ -n "$filename" ] && { printf '%s\t%s\n' "$version" "$filename"; return 0; }
+	done
+	return 1
+}
+
+# For '--source apt' -- same idea as sketch_pacman_lookup. Tries the
+# LOCAL indices first (/var/lib/apt/lists, populated by 'apt update' --
+# not fetched by sketch itself, instant, no network round-trip). If
+# that comes up empty, falls back to downloading Packages.gz fresh from
+# APT_MIRROR/APT_SUITE/APT_COMPONENTS (forge.conf) for each configured
+# component into a temp dir and scanning that instead -- works on a
+# non-Debian machine or a stale/never-updated one. Prints
+# URL<TAB>VERSION, or nothing (and fails) if the package isn't found
+# either way.
+sketch_apt_lookup() {
+	local pkg="$1"
+	local result version filename
+
+	result=$(sketch_apt_scan "/var/lib/apt/lists" "$pkg")
+	if [ -n "$result" ]; then
+		IFS=$'\t' read -r version filename <<< "$result"
+		local base
+		base=$(grep -h -m1 '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null | awk '{print $2}')
+		if [ -n "$base" ]; then
+			printf '%s\t%s\n' "${base%/}/${filename}" "$version"
+			return 0
+		fi
+	fi
+
+	echo "Not found in the local package index (or none exists) -- checking $APT_MIRROR directly..." >&2
+	local tmp_dir apt_arch comp
+	tmp_dir=$(mktemp -d)
+	apt_arch=$(command -v dpkg >/dev/null 2>&1 && dpkg --print-architecture 2>/dev/null)
+	[ -z "$apt_arch" ] && apt_arch="amd64"
+	for comp in $APT_COMPONENTS; do
+		wget -qO "${tmp_dir}/${comp}_Packages.gz" "${APT_MIRROR%/}/dists/${APT_SUITE}/${comp}/binary-${apt_arch}/Packages.gz" 2>/dev/null
+	done
+	result=$(sketch_apt_scan "$tmp_dir" "$pkg")
+	rm -rf "$tmp_dir"
+	[ -z "$result" ] && return 1
+
+	IFS=$'\t' read -r version filename <<< "$result"
+	printf '%s\t%s\n' "${APT_MIRROR%/}/${filename}" "$version"
+}
+
+sketch_detect_build_system() {
+	local tarball="$1"
+	local listing
+	case "$tarball" in
+		*.zip) listing=$(unzip -l "$tarball" 2>/dev/null | awk '{print $NF}') ;;
+		*) listing=$(tar -tf "$tarball" 2>/dev/null) ;;
+	esac
+	[ -z "$listing" ] && return 1
+
+	local top_level
+	top_level=$(printf '%s\n' "$listing" | awk -F/ 'NF==2 {print $2}')
+	[ -z "$top_level" ] && return 1
+
+	if printf '%s\n' "$top_level" | grep -qx 'meson.build'; then
+		echo "meson"
+	elif printf '%s\n' "$top_level" | grep -qx 'configure'; then
+		echo "configure"
+	elif printf '%s\n' "$top_level" | grep -qx 'autogen.sh'; then
+		echo "autogen"
+	elif printf '%s\n' "$top_level" | grep -qx 'setup.py'; then
+		echo "setuppy"
+	else
+		return 1
+	fi
+}
+
+# Fills in generic heat()/mold()/smith() bodies (SK_HEAT_BODY/
+# SK_MOLD_BODY/SK_SMITH_BODY -- not `local`, deliberately: this runs
+# inline in the 'sketch' case, the same way the book-scraping path
+# above sets them) for the build system sketch_detect_build_system
+# identified. These are the same commands the LFS/BLFS book itself
+# uses for a plain meson/autotools/python package with no unusual
+# flags -- a fine starting point, but still just a guess: REVIEW
+# before smithing, especially for --disable-static (not every
+# autotools package supports it) and any project-specific
+# configure/meson flags. setup.py-based packages have no separate
+# configuration step, so heat() is just a note saying so.
+sketch_generic_build_commands() {
+	local kind="$1"
+	case "$kind" in
+		meson)
+			SK_HEAT_BODY='meson setup --prefix=/usr build/'$'\n'
+			SK_MOLD_BODY='ninja -C build/'$'\n'
+			SK_SMITH_BODY='DESTDIR="$1" ninja -C build/ install'$'\n'
+			;;
+		configure)
+			SK_HEAT_BODY='./configure --prefix=/usr --disable-static'$'\n'
+			SK_MOLD_BODY='make'$'\n'
+			SK_SMITH_BODY='make DESTDIR="$1" install'$'\n'
+			;;
+		autogen)
+			SK_HEAT_BODY='./autogen.sh'$'\n''./configure --prefix=/usr --disable-static'$'\n'
+			SK_MOLD_BODY='make'$'\n'
+			SK_SMITH_BODY='make DESTDIR="$1" install'$'\n'
+			;;
+		setuppy)
+			SK_HEAT_BODY="echo 'No configuration for this package'"$'\n'
+			SK_MOLD_BODY='python3 setup.py build'$'\n'
+			SK_SMITH_BODY='DESTDIR="$1" python3 setup.py install'$'\n'
+			;;
+	esac
+}
+
+
+
+sketch_extract_patches() {
+	local html="$1" page_url="$2"
+
+	printf '%s' "$html" \
+		| grep -zoP 'href\s*=\s*"[^"]+\.patch"' \
+		| sed -z 's/\n/ /g' | tr '\0' '\n' \
+		| grep -oP 'href\s*=\s*"\K[^"]+' \
+		| while IFS= read -r href; do
+			sketch_resolve_url "$page_url" "$href"
+			echo ""
+		done \
+		| sort -u
+}
+
+# Scans "Download ...: <link>" list items (the same <li class="listitem">
+# convention verified for the main tarball/patch) for additional
+# downloads beyond the main tarball -- things some pages list as their
+# own separate file (a second required/recommended source archive, a
+# keyring, test data, etc.), as opposed to a dependency covered by its
+# own recipe. $3 is the main tarball URL and is excluded, since its own
+# HTTP/FTP mirror lines would otherwise show up as false positives here.
+# Prints one line per find: "URL<TAB>OPTIONAL" where OPTIONAL is 1 if
+# the word "optional" appears in that list item's own text, else 0.
+# This is a best-effort heuristic, same caveat as sketch_extract_patches.
+sketch_extract_additional_downloads() {
+	local html="$1" page_url="$2" main_url="$3"
+
+	printf '%s' "$html" \
+		| grep -zoP '<li[^>]*class\s*=\s*"listitem"[^>]*>.*?</li>' \
+		| sed -z 's/\n/ /g' | tr '\0' '\n' \
+		| grep -i 'download' \
+		| grep -viP 'md5|sha(1|256|512)|download size' \
+		| while IFS= read -r li; do
+			href=$(printf '%s' "$li" | grep -oP 'href\s*=\s*"\K[^"]+\.(tar\.(gz|xz|bz2|zst)|tgz|tar|zip)(?=")' | head -n1)
+			[ -z "$href" ] && continue
+			resolved=$(sketch_resolve_url "$page_url" "$href")
+			[ "$resolved" = "$main_url" ] && continue
+			if printf '%s' "$li" | grep -qi 'optional'; then
+				printf '%s\t1\n' "$resolved"
+			else
+				printf '%s\t0\n' "$resolved"
+			fi
+		done \
+		| sort -u -t $'\t' -k1,1
+}
+
+# Extracts every <pre class="userinput">/<pre class="root"><kbd class=
+# "command">...</kbd></pre> block from the raw HTML, decoding entities and
+# stripping any nested tags. The book marks build steps with
+# class="userinput" on the <pre> and install/root-only steps with
+# class="root" -- that's what decides R vs U here (falling back to
+# checking for "root user" in the ~500 chars before the block, in case a
+# future book edition changes the class name again). Prints one line per
+# block: "R<TAB>escaped_text" or "U<TAB>escaped_text". Newlines inside a
+# block are encoded as literal "\n" so each record stays on one line;
+# decode with `printf '%b'`. Requires python3.
+sketch_extract_blocks() {
+	local html="$1"
+	local script
+	script=$(mktemp)
+	cat > "$script" << 'PYEOF'
+import sys, re, html as htmllib
+
+data = sys.stdin.read()
+
+# Every section heading (h2/h3/h4) with its text and position, so each
+# command block can be attributed to the section it falls under. The
+# book's own convention: "Installation of X" holds the build/install
+# steps (mold()/smith()); a later "Configuring X" section (Config Files,
+# Configuration Information, etc.) holds post-install setup that acts on
+# the real system, not the staged install -- that maps to Forge's
+# finish() hook, not smith().
+headings = []
+for hm in re.finditer(r'<h[234][^>]*>(.*?)</h[234]>', data, re.S):
+    text = re.sub(r'<[^>]+>', '', hm.group(1))
+    text = htmllib.unescape(text).strip()
+    headings.append((hm.start(), text))
+
+def section_for(pos):
+    current = ""
+    for hpos, htext in headings:
+        if hpos > pos:
+            break
+        current = htext
+    return current
+
+pattern = re.compile(
+    r'<pre[^>]*class\s*=\s*"(userinput|root)"[^>]*>\s*<kbd[^>]*class\s*=\s*"command"[^>]*>(.*?)</kbd>\s*</pre>',
+    re.S,
+)
+
+for m in pattern.finditer(data):
+    pre_class = m.group(1)
+    context = data[max(0, m.start() - 500):m.start()]
+    is_root = pre_class == "root" or bool(re.search(r'root user|class="root"', context, re.I))
+    section = section_for(m.start())
+    is_configuring = bool(re.search(r'config', section, re.I))
+
+    # Only the paragraph immediately before the block -- not the wider
+    # 500-char window used above -- so an unrelated "optional" mention
+    # earlier on the page (e.g. in the Package Information box) doesn't
+    # bleed into classifying the real install steps as optional.
+    para_matches = list(re.finditer(r'<p[^>]*>(.*?)</p>', context, re.S))
+    near_text = para_matches[-1].group(1) if para_matches else context[-200:]
+    near_text = re.sub(r'<[^>]+>', '', near_text)
+    is_optional = bool(re.search(r'\boptional\b|\bif you\b|\bif desired\b', near_text, re.I))
+
+    if is_configuring:
+        tag = "F"
+    else:
+        tag = "R" if is_root else "U"
+    if is_optional:
+        tag += "O"
+
+    block = re.sub(r'<[^>]+>', '', m.group(2))
+    block = htmllib.unescape(block).strip()
+    block = block.replace('\\', '\\\\').replace('\n', '\\n')
+    print(tag + "\t" + block)
+PYEOF
+	printf '%s' "$html" | python3 "$script"
+	rm -f "$script"
+}
+
+# Detects "multi-package" book pages -- a single page listing many small
+# packages one after another (BLFS's "Perl Modules"/"Python Modules"/
+# "Perl Module Dependencies" pages are exactly this: one <h2> section
+# per module, each with its own Download/checksum and install
+# commands). Splits $1 (the raw page HTML) at each <h2> boundary and
+# prints one NUL-separated record per section that actually looks like
+# a package (i.e. has its own download link) -- others (the page's own
+# intro, a trailing "automated install" section with no download, etc.)
+# are skipped. Each record is "heading_text<TAB>section_html". Prints
+# nothing if the page doesn't look like a multi-package page at all
+# (fewer than 2 qualifying sections).
+sketch_split_multi_page() {
+	local html="$1"
+	local script
+	script=$(mktemp)
+	cat > "$script" << 'PYEOF'
+import sys, re
+
+data = sys.stdin.read()
+headings = list(re.finditer(r'<h2[^>]*>(.*?)</h2>', data, re.S))
+
+records = []
+for i, hm in enumerate(headings):
+    start = hm.start()
+    end = headings[i + 1].start() if i + 1 < len(headings) else len(data)
+    section = data[start:end]
+    if not re.search(r'Download\s*\(HTTP\)', section, re.I):
+        continue
+    records.append(section)
+
+if len(records) >= 2:
+    for r in records:
+        sys.stdout.buffer.write(r.encode("utf-8", "surrogatepass"))
+        sys.stdout.buffer.write(b"\0")
+PYEOF
+	printf '%s' "$html" | python3 "$script"
+	rm -f "$script"
+}
+
+# Generates one recipe from $1 (a single package's HTML slice -- either
+# a whole page for normal single-package sketching, or one <h2> section
+# from sketch_split_multi_page for a multi-package page), writing it to
+# RECIPE_DIR/$3/<name>.sh where <name> is derived from the tarball
+# filename (matching Forge's naming convention everywhere else), not
+# the book's own heading text. $2 is the source page URL (for the
+# header comment and patch-link resolution), $4 is 1 to overwrite an
+# existing recipe at that path. Returns 1 (writing nothing) if no
+# download link was found in the slice, or a recipe already exists
+# there and $4 wasn't set. Prints the path written on success.
+sketch_generate_one() {
+	local section_html="$1" page_url="$2" category="$3" force="$4"
+
+	local metadata url_template version algo checksum
+	metadata=$(sketch_extract_metadata "$section_html")
+	[ -z "$metadata" ] && return 1
+	IFS=$'\t' read -r url_template version algo checksum <<< "$metadata"
+
+	local concrete_url stem name
+	concrete_url="${url_template//\$\{VERSION\}/$version}"
+	stem=$(basename "$concrete_url")
+	stem="${stem%.tar.gz}"; stem="${stem%.tar.xz}"; stem="${stem%.tar.bz2}"; stem="${stem%.tgz}"; stem="${stem%.tar}"; stem="${stem%.zip}"
+	name="${stem%-$version}"
+	name=$(printf '%s' "$name" | tr 'A-Z' 'a-z' | tr ':' '-' | tr -s '-')
+	[ -z "$name" ] && return 1
+
+	local target="${RECIPE_DIR}/${category}/${name}.sh"
+	if [ -f "$target" ] && [ "$force" -ne 1 ]; then
+		return 1
+	fi
+
+	local mold_body="" smith_body="" finish_body="" heat_body="" sk_tag sk_block real_block
+	while IFS=$'\t' read -r sk_tag sk_block; do
+		[ -z "$sk_tag" ] && continue
+		real_block=$(printf '%b' "$sk_block")
+		if [[ "$sk_tag" == *O ]]; then
+			real_block="# OPTIONAL per the book (verify whether you want this) -->"$'\n'"${real_block}"
+			sk_tag="${sk_tag%O}"
+		fi
+		case "$sk_tag" in
+			F) finish_body+="${real_block}"$'\n' ;;
+			R) smith_body+="${real_block}"$'\n' ;;
+			*) mold_body+="${real_block}"$'\n' ;;
+		esac
+	done < <(sketch_extract_blocks "$section_html")
+
+	if [ -z "$smith_body" ] && [ -n "$mold_body" ]; then
+		local last_line
+		last_line=$(printf '%s\n' "$mold_body" | grep -E '(make|ninja|meson).*install' | tail -n1)
+		if [ -n "$last_line" ]; then
+			mold_body=$(printf '%s\n' "$mold_body" | grep -vF "$last_line")
+			smith_body="${last_line}"$'\n'
+		fi
+	fi
+
+	if [ -n "$mold_body" ]; then
+		sketch_split_heat_mold "$mold_body"
+		heat_body="$SK_HEAT_BODY"
+		mold_body="$SK_MOLD_BODY"
+	fi
+	if [ -z "$heat_body" ]; then
+		heat_body="echo 'No configuration for this package'"$'\n'
+	fi
+
+	local heredoc_fix='s/<<[[:space:]]*("|'"'"')?([A-Za-z_][A-Za-z0-9_]*)\1/<<-\1\2\1/'
+	heat_body=$(printf '%s\n' "$heat_body" | sed -E "$heredoc_fix")
+	mold_body=$(printf '%s\n' "$mold_body" | sed -E "$heredoc_fix")
+	smith_body=$(printf '%s\n' "$smith_body" | sed -E "$heredoc_fix")
+	finish_body=$(printf '%s\n' "$finish_body" | sed -E "$heredoc_fix")
+
+	local build_dir
+	build_dir=$(sketch_detect_build_dir "$mold_body")
+	if [ -n "$build_dir" ]; then
+		smith_body="cd \"${build_dir}\"  # mold() builds here; smith() starts fresh in \$SRC_DIR"$'\n'"${smith_body}"
+	fi
+
+	smith_body=$(printf '%s\n' "$smith_body" \
+		| sed -e 's/\(make[^&|;]*\)install\b/\1DESTDIR="$1" install/' \
+		      -e 's/\(ninja[^&|;]*\)install\b/DESTDIR="$1" \1install/')
+	smith_body=$(printf '%s\n' "$smith_body" | while IFS= read -r sk_line; do
+		if printf '%s' "$sk_line" | grep -qE '(/usr/|/etc/|/var/|/opt/)' \
+			&& ! printf '%s' "$sk_line" | grep -qE 'DESTDIR|\$1'; then
+			printf '%s  # TODO: references an absolute path -- check whether it needs to be prefixed with "$1"\n' "$sk_line"
+		else
+			printf '%s\n' "$sk_line"
+		fi
+	done)
+
+	local patches=() patch_url
+	while IFS= read -r patch_url; do
+		[ -z "$patch_url" ] && continue
+		patches+=("$patch_url")
+	done < <(sketch_extract_patches "$section_html" "$page_url")
+
+	mkdir -p "$(dirname "$target")"
+	{
+		echo "# Auto-generated by 'forge sketch' (multi-package page) from:"
+		echo "#   $page_url"
+		echo "# REVIEW before using: check configure/meson/cmake flags, the DEPS array,"
+		echo "# and whether smith() really installs into \"\$1\" (staging), not the real system."
+		echo ""
+		echo "NAME=\"${name}\""
+		echo "VERSION=\"${version}\""
+		echo "URL=\"${url_template}\""
+		if [ "$algo" = "sha256" ] && [ -n "$checksum" ]; then
+			echo "SHA256SUM=\"${checksum}\""
+		elif [ "$algo" = "md5" ] && [ -n "$checksum" ]; then
+			echo "MD5SUM=\"${checksum}\""
+		else
+			echo "# TODO: no checksum was automatically found on the page; add SHA256SUM or MD5SUM."
+		fi
+		if [ ${#patches[@]} -gt 0 ]; then
+			echo "EXTRA_FILES=("
+			for patch_url in "${patches[@]}"; do
+				echo "	\"${patch_url}\"  # TODO: add ::sha256sum after verifying"
+			done
+			echo ")"
+		fi
+		echo ""
+		echo "heat() {"
+		printf '%s\n' "$heat_body" | sed '/^[[:space:]]*$/d; s/^/\t/'
+		echo "}"
+		echo ""
+		echo "mold() {"
+		printf '%s\n' "$mold_body" | sed '/^[[:space:]]*$/d; s/^/\t/'
+		echo "}"
+		echo ""
+		echo "smith() {"
+		printf '%s\n' "$smith_body" | sed '/^[[:space:]]*$/d; s/^/\t/'
+		echo "}"
+		if [ -n "$finish_body" ]; then
+			echo ""
+			echo "finish() {"
+			printf '%s\n' "$finish_body" | sed '/^[[:space:]]*$/d; s/^/\t/'
+			echo "}"
+		fi
+	} > "$target"
+
+	echo "  -> ${category}/${name}.sh"
+	return 0
+}
+
+if [ -z "$COMMAND" ]; then
+	echo "Usage: forge [smith|assay|probe|sketch|temper|melt|gauge|repo|orphans|search] [package name]"
+	echo "       forge [patts|wares]"
+	echo "Run 'forge help' for details on each command and flag."
+	exit 1
+fi
+
+case "$COMMAND" in
+	help|--help|-h)
+		cat << 'EOF'
+Forge - bash-based package manager for LFS
+
+Usage: forge <command> [package] [flags]
+	   forge <wares|patts|menu>
+
+Sandbox mode: if Forge can't actually write to the real system (most
+commonly: not running as root), it automatically redirects every path
+(recipes, logs, checksums, work dir, lang files, lock file, repo cache)
+to a sandbox under $HOME/.forge/, and "installed" packages land under
+$HOME/.forge/root instead of the real filesystem. This is checked with
+a real write test, not a platform sniff, so it covers Termux (no root,
+no real /etc or /usr on Android), a regular user account without sudo,
+a restricted container, or anything else. It's meant for trying recipes
+and the whole smith/sketch/probe flow out away from the actual LFS
+machine, not for a permanent non-root install. Set FORGE_SANDBOX=0 to
+force real system paths regardless, or FORGE_SANDBOX=1 to force the
+sandbox even when running as root. Every path is still an explicit env
+var or forge.conf override away regardless (RECIPE_DIR, LOG_DIR,
+CHECKSUM_DIR, WORKDIR, LANG_DIR, INSTALL_ROOT, REPO_DIR, FORGE_HOME sets
+all of the above at once). 'forge menu' also accepts 'dialog' in place
+of whiptail, since that's what Termux actually packages.
+
+Commands:
+   smith <pkg> [-y|--yes] [-f|--force] [--dry-run] [--clean|--fresh] [--no-cache] [--no-store] [--no-strip] [--keep-la] [--with-<opt>|--without-<opt> ...]
+     Downloads (or, for a GIT_URL recipe, clones), heats (configures),
+     molds (builds), and smiths (installs) a package from its recipe
+     (located at /etc/forge/recipes/).
+			-y, --yes		Skip confirmation prompts. On a fresh install or upgrade, it proceeds automatically; if the same version is already installed, it does nothing (no redundant reinstall). Also answers any OPTIONS prompt with that option's own default.
+			-f, --force		Force a reinstall even if the package is already up to date.
+			--dry-run		Show what would happen (fresh install / upgrade / already installed, checksum status, dependencies) without downloading, building or installing anything.
+			--clean, --fresh	Discard any previous partial build for this package/version and start over (download, extract, mold, smith all from scratch). Also forces a rebuild even if a matching pre-built package exists in the repo.
+			--no-cache		Never use a pre-built package from the repo for this run, even if one matches -- always build from source.
+			--no-store		Don't save a freshly-built package into the repo afterward. Has no effect when a cached build was used instead of building.
+			--no-strip		Keep debug symbols in installed binaries/libraries (see "Cleanup" below). Useful when you'll be debugging this specific build.
+			--keep-la		Keep libtool .la files instead of deleting them (see "Cleanup" below).
+			--with-<opt>, --without-<opt>	Answer one of the recipe's OPTIONS on the command line instead of being prompted (see OPTIONS below).
+
+     If heat()/mold() get interrupted (Ctrl+C, closed terminal, power
+     loss) or fail partway through, the extracted source tree is kept
+     as-is instead of being wiped -- running 'forge smith <pkg>' again
+     picks up right where it left off. This is NOT line-by-line
+     resumption inside heat()/mold()/smith() -- Forge only tracks three
+     checkpoints: whether the source is already extracted (or, for a
+     GIT_URL recipe, cloned), whether heat() already finished
+     successfully once, and whether mold() already finished
+     successfully once. Whichever of heat()/mold() didn't finish is
+     rerun from its own start on the next attempt (relying on
+     make/ninja/cargo/x.py and most build systems being incremental by
+     nature to skip what's already done, since their own build
+     directory is preserved too); whichever DID finish is skipped
+     entirely. This only resumes for the SAME version -- if the
+     recipe's VERSION changed since the interrupted attempt, it starts
+     fresh automatically. Use --clean to discard an in-progress build
+     on purpose (e.g. after editing heat()/mold()/smith(), or if a
+     build got into a bad state) instead of resuming it.
+
+     A recipe may optionally define finish(), run after the package is
+     copied onto the real filesystem (not the staging directory). Use it
+     for steps that only make sense on the real installed path, such as
+     setcap on the final binary.
+
+     A recipe defines GIT_URL instead of URL to be sourced via
+     'git clone' (shallow, --depth 1) rather than a tarball download --
+     see 'sketch --source git' above for the easiest way to generate
+     one. GIT_REF (a tag, branch, or commit) is optional; without it,
+     the repo's default branch HEAD is cloned. Everything else about
+     the package (heat()/mold()/smith(), OPTIONS, caching, the repo)
+     works exactly the same either way -- caching in particular still
+     applies, keyed the same way (recipe content + OPTIONS), so a
+     git-sourced package that takes a while to build still only pays
+     that cost once per config.
+
+     A recipe defines PKG_FORMAT ('pacman' or 'deb') alongside a normal
+     URL to install an already-built binary package from another
+     distro's format directly -- Arch's .pkg.tar.zst/.xz or Debian's
+     .deb -- instead of building anything. URL still points at the
+     actual package file (a repo mirror, a local path, wherever); Forge
+     downloads it exactly like any other package, then extracts it
+     itself and stages the real files into PKG_DIR, the same role it
+     always has. heat()/mold()/smith() are NOT called for a PKG_FORMAT
+     recipe -- there's nothing to configure or build, only to unpack --
+     so don't define them (sketch generates a PKG_FORMAT recipe without
+     them; assay doesn't require them either for this case). The
+     package's own version (pacman's pkgver from .PKGINFO, or Debian's
+     Version: from control) is used in place of the recipe's own
+     VERSION whenever the two disagree, since that's the authoritative
+     source. Maintainer scripts (pacman's .INSTALL post_install/
+     post_upgrade, Debian's postinst) are deliberately NOT run --
+     most of what they'd typically do (ldconfig, mandb, desktop/icon/
+     mime caches) is already covered generically by the Hooks system
+     below; 'smith' prints a note when a package had one, so you can
+     check by hand if something package-specific seems to be missing.
+     Everything else (caching, hooks, history, OPTIONS) works the same
+     as any other recipe.
+
+     A recipe may optionally define heat(), run before mold() to handle
+     configuration (./configure, meson setup, cmake, autogen.sh) as its
+     own tracked step -- see the resume paragraph above for why this is
+     separate from mold() rather than lumped into it. Recipes generated
+     by 'sketch' always define one, using
+     echo 'No configuration for this package' as a no-op placeholder
+     when the detected build system has no separate configure step
+     (setup.py-based packages, mainly). heat() is optional for the sake
+     of recipes written before this existed -- if a recipe has none,
+     that step is just skipped.
+
+     A recipe may optionally define OPTIONS, an array of
+     "key:description:default" entries (default being 'y' or 'n'), for
+     build-time choices mold()/smith() can branch on -- e.g.:
+       OPTIONS=("doxygen:Build API documentation with Doxygen:n")
+     mold()/smith() read the choice from $OPT_DOXYGEN (key upper-cased,
+     - to _; always "y" or "n"). Each option is resolved, in order: from
+     --with-<key>/--without-<key> on the command line; else the
+     recipe's own default when running with -y/--yes; else an
+     interactive prompt in the book's own "[y/N]"/"[Y/n]" style.
+
+     Before building, smith checks the repo (REPO_DIR, see 'forge repo'
+     below) for a package already built with the exact same recipe
+     content and OPTIONS. On a match, it skips the download and mold()
+     entirely and installs straight from that cached build. On a miss,
+     it builds normally and -- unless --no-store was given -- caches
+     the result afterward for next time. This applies only to packages
+     with a real URL (tarball); self-contained meta-packages are never
+     cached.
+
+     Cleanup: as soon as smith() (make/ninja install, staged via DESTDIR
+     into PKG_DIR) finishes a fresh build, the entire extracted
+     source/build tree (SRC_DIR) is deleted right then -- not held onto
+     until the whole run finishes. Nothing past that point needs it:
+     manifest generation, caching, and the final copy to the real
+     filesystem all work from PKG_DIR alone. This matters most for
+     packages like LLVM or Firefox, whose build directory alone can run
+     many times the size of what actually ends up installed -- with the
+     old end-of-run cleanup, that whole tree sat on disk well past the
+     point it was needed. (This never applied to a repo cache hit --
+     there's no source/build tree to begin with when installing straight
+     from a cached build.)
+
+     Forge also strips debug symbols from ELF binaries/libraries and
+     deletes libtool .la files in PKG_DIR right after, before it's
+     installed onto the real system or cached in the repo. Both are
+     standard LFS/BLFS practice and don't change runtime behavior --
+     Linux binaries don't need .la files the way some other Unixes do,
+     and stripping only removes symbols used for debugging, not
+     anything the program needs to run. This is what actually shrinks
+     what stays installed build over build. Skip with --no-strip /
+     --keep-la, or turn either off permanently via STRIP_BINARIES=0 /
+     REMOVE_LA_FILES=0 in forge.conf. The repo tarball itself is also
+     compressed at xz -9e (max, slower) rather than the default level,
+     since a cached build is written once but meant to be reused --
+     size matters more there than build-time speed.
+
+     Hooks: right after installing files onto the real system, 'smith'
+     checks the manifest it just wrote against FORGE_HOOKS (a table of
+     "pattern::command" pairs, editable in forge.conf) and runs whatever
+     matches -- glib-compile-schemas for GSettings schemas,
+     update-desktop-database for .desktop files, gtk-update-icon-cache
+     for icons, mandb for man pages, ldconfig for shared libraries,
+     update-mime-database for MIME data. Each matching command runs at
+     most once per install, and a hook whose command isn't on PATH is
+     skipped with a note rather than failing the install.
+
+     History: every successful install/upgrade/removal (from 'smith' or
+     'melt') appends one line to HISTORY_FILE
+     (/etc/forge/log/history.log by default) -- timestamp, action, name,
+     version. Purely a record for your own reference (nothing reads it
+     back for rollback); it's meant to answer "when did I install this"
+     without relying on memory.
+
+     Dependency cascade: when installing a package with unmet DEPS,
+     independent packages at the same point in the tree (neither
+     depends on the other) build concurrently instead of one at a
+     time -- capped at MAX_PARALLEL_JOBS (forge.conf; defaults to
+     nproc) regardless of how wide that point in the tree is. A
+     package still only starts once everything IT depends on has
+     already finished. Set PARALLEL_DEPS=0 in forge.conf to force
+     strictly sequential installs instead (easier to read the combined
+     output of a big cascade, at the cost of speed).
+
+   assay <pkg>
+     Validates a recipe before you ever smith it: checks NAME/VERSION/URL are set, mold() (build method) or smith() (install method) functions exist, dependecies DEPS have matching recipes, and warns if no checksum SHA256SUM/MD5SUM or CRLF line endings are present.
+
+   Checksums can also live outside the recipe, in /etc/forge/checksums/<pkg>.sha256sum
+   or .md5sum (just the hash, one line). If present, this takes priority over
+   SHA256SUM/MD5SUM set inside the recipe itself.
+
+   probe <pkg|--all> [--update] [-y|--yes]
+     Checks upstream for a newer version, without installing anything.
+     Requires a recipe to define:
+       VERSION_CHECK_URL="<page listing available versions/tarballs>"
+       VERSION_REGEX='<grep -oP pattern that prints ONLY the version>'
+     Use \K to drop everything matched before the version, and a (?=...)
+     lookahead to drop what comes after, so the pattern prints just the
+     version string. Example, for a directory listing full of links like
+     "gdk-pixbuf-2.42.12.tar.xz":
+       VERSION_REGEX='gdk-pixbuf-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.xz)'
+     Recipes without both fields are skipped (silently under --all, with
+     a note otherwise). With --update, rewrites VERSION="..." in the
+     recipe file (keeping a .bak), and refreshes the checksum via the
+     recipe's existing CHECKSUM_URL. The URL field itself does not need
+     to change, since it's already expected to reference \${VERSION}.
+     Does not install anything -- follow up with 'forge temper <pkg>'.
+
+   sketch <pkg> [--source lfs|blfs|slfs|glfs|mlfs|gnome|git|pacman|apt] [-s <source>] [--url <page, tarball, or git repo>] [--ref <tag/branch/commit>] [--category <dir>] [--force]
+     Generates a DRAFT recipe by looking up <pkg> in the LFS, BLFS,
+     SLFS, GLFS, or MLFS book and scraping its page: download link,
+     version, checksum (if listed), any patch or additional-download
+     links, and the book's own build/install shell commands, split
+     into mold() (build steps), smith() (the step(s) run "as the root
+     user" during Installation, i.e. install), and finish() (any
+     step(s) found under a later "Configuring <pkg>" section/
+     subsection -- these run against the real installed system, same
+     as smith()'s own "$1", which is why they aren't rewritten with
+     DESTDIR). --book is still accepted as an alias for --source.
+     Matching against a book is EXACT (on the page's own URL slug, not
+     its link text) -- "gtkmm" will never silently resolve to whatever
+     "gtkmm3"/"gtkmm4" page happens to come first. On a total miss,
+     sketch lists every slug that merely contains <pkg> as a
+     "Did you mean" suggestion instead of guessing for you.
+     Without --source, all six are tried in order (blfs, slfs, glfs,
+     mlfs, lfs, gnome), stopping at the first match -- pass --source to
+     search only one. "gnome" is different from the rest: instead of a
+     book page, it looks up <pkg> directly under
+     download.gnome.org/sources/<pkg>/, picks the newest series
+     directory (alpha/beta included -- this can outrank the latest
+     stable release, which is intentional) and the newest tarball
+     inside it. It never has build commands to scrape (see "Generic
+     build detection" below).
+     LFS itself is a special case: its package pages (chapter 5-8/9)
+     have the build commands but not the download link/checksum --
+     those live on separate chapter 3 pages (Packages and Patches).
+     When --source lfs matches (or is passed explicitly), sketch also
+     fetches those two chapter 3 pages and uses them as a fallback
+     for the download/checksum/patch info.
+     Generic build detection: whenever no command blocks were found on
+     the source page (or there was no page at all -- the "gnome"
+     source, or a direct tarball --url), sketch downloads the tarball
+     and looks at its top-level files to guess mold()/smith(), in this
+     priority: meson.build > configure > autogen.sh > setup.py. These
+     are generic, standard commands (plain meson/autotools/distutils,
+     no project-specific flags) -- always review them before smithing.
+     Requires python3 (used for the HTML parsing).
+
+     Also best-effort: a build subdirectory (mkdir build && cd build,
+     common with meson/cmake) detected in mold() gets a matching cd
+     added at the start of smith(), since mold() and smith() run as
+     separate pipeline stages and don't share a working directory.
+     Additional download links found beside the main tarball (besides
+     patches, which go into EXTRA_FILES) are added to mold() as a plain
+     wget line -- commented out if the book marks that one optional.
+
+     --url accepts EITHER a documentation page to scrape (same as any
+     book match) OR a link straight to a tarball (e.g. a GitHub release
+     asset, or any host with no page at all) -- recognized by its file
+     extension (.tar.gz/.tar.xz/.tar.bz2/.tar.zst/.zip). A direct
+     tarball skips page-scraping entirely: VERSION is parsed from the
+     filename itself (expects "name-1.2.3.tar.xz"), and mold()/smith()
+     come from Generic build detection above, since there's no page to
+     scrape commands from. Use --url when the package isn't found
+     automatically, to point at a book edition/mirror not covered by
+     the defaults, or for any tarball with no book/GNOME entry at all.
+
+     --source git --url <git repo URL> [--ref <tag/branch/commit>]:
+     for a package whose released tarballs lag behind its actual git
+     history (an upstream that's slow to cut releases, or effectively
+     abandoned, while real fixes sit on the default branch). Shallow-
+     clones the repo (no page to scrape, same as "gnome") and detects
+     the build system straight from the checked-out tree -- same
+     priority as everywhere else: meson.build > configure > autogen.sh
+     > setup.py. Without --ref, picks the newest tag (sort -V,
+     alpha/beta included); with no tags at all, falls back to the
+     default branch's HEAD, and VERSION becomes that commit's short
+     hash. The recipe gets GIT_URL/GIT_REF instead of URL/checksum --
+     'smith' clones at that ref instead of downloading+extracting a
+     tarball (see 'smith' below). GIT_REF is written out explicitly
+     even when auto-detected: an unpinned branch means every future
+     'smith' could silently pull something different, which defeats
+     the point of a reproducible recipe.
+
+     --source pacman|apt <pkg>: resolves <pkg> to a download URL,
+     preferring the LOCAL package index your system already has --
+     pacman's sync databases (/var/lib/pacman/sync/*.db, populated by
+     'pacman -Sy') or apt's (/var/lib/apt/lists/*_Packages, populated
+     by 'apt update') -- since that's instant and needs no network
+     round-trip at all. When there's no usable local index (not on
+     Arch/Debian, or the package just isn't in what's currently
+     synced), automatically falls back to fetching the sync
+     databases/Packages files directly from PACMAN_MIRROR/PACMAN_REPOS
+     or APT_MIRROR/APT_SUITE/APT_COMPONENTS (forge.conf; sane defaults
+     built in) -- this works even on a machine with no pacman/apt
+     installed at all, since only wget/tar/awk are needed either way.
+     On a hit, builds the real download URL (pacman: from
+     /etc/pacman.d/mirrorlist when using the local index, or straight
+     from PACMAN_MIRROR when fetched fresh, substituting $repo/$arch
+     same as pacman itself; apt: from the Filename: field combined
+     with the first "deb " line in /etc/apt/sources.list(.d), or
+     APT_MIRROR directly) and falls straight into the PKG_FORMAT
+     handling above -- same generated recipe you'd get from
+     'sketch --url' pointed directly at that .pkg.tar.zst/.deb. Since
+     "found nothing" here can still just mean the wrong repos/suite
+     are configured rather than the package not existing, these stay
+     opt-in only (via --source), never part of the default
+     multi-source search.
+
+     --category places the recipe under RECIPE_DIR/<dir>/ instead of the
+     top level (matching subfolders like python-modules/).
+     --force overwrites an existing recipe at that path.
+
+     The book installs straight onto the real system, with no notion of
+     staging -- so 'make install'/'ninja install' lines in smith() are
+     rewritten to add DESTDIR="$1", matching how smith() is expected to
+     install here. This, the mold()/smith()/finish() split, the build-
+     directory detection, and the optional-download detection are all
+     best-effort heuristics based on how the book's HTML is structured.
+     The generated recipe is marked as a draft and always needs a look
+     before you trust it -- run 'forge assay <pkg>' and read through
+     mold()/smith()/finish() yourself before smithing.
+
+     The book index URLs are in /etc/forge/forge.conf
+     (LFS_BOOK_INDEX_URL / BLFS_BOOK_INDEX_URL / SLFS_BOOK_INDEX_URL),
+     editable if a book's structure changes or you want to point at a
+     different edition.
+
+   temper <pkg|--all> [-y|--yes]
+     Updates a single package to the version in its recipe, only if it differs from what's installed. With --all, checks every installed package, lists what's outdated, asks for one confirmation, then updates them all.
+
+   melt <pkg> [-y|--yes] [--with-deps]
+     Uninstalls a package: removes every file and directory it's known to have installed, then deletes its record. Warns first if another installed package depends on it.
+			--with-deps	After removing <pkg>, checks whether that left any of its own dependencies orphaned (installed only as a dependency, nothing left needs them) and offers to remove those too -- same idea as 'pacman -Rns'.
+
+   orphans
+     Lists installed packages that were pulled in only as a dependency
+     and that nothing currently installed needs anymore (pacman's
+     '-Qdt'). Chains cascade correctly -- if removing one orphan would
+     orphan another, both show up. Doesn't remove anything by itself;
+     see 'melt --with-deps' to actually clean them up as part of
+     removing whatever pulled them in.
+
+   search <term>
+     Case-insensitive search over every recipe's NAME and DESCRIPTION
+     in RECIPE_DIR (not just installed ones), showing install status
+     for each match. For a package not in any local recipe yet, try
+     'forge sketch <term>' instead, which looks it up in a book/GNOME/
+     git rather than searching what you already have.
+
+   wares
+     Lists packages currently installed by forge, with their version.
+
+   patts
+     Short for "patterns", lists every recipe available in /etc/forge/recipes (whether installed or not), with version and install status (installed/not installed).
+
+   gauge <pkg>
+     Shows a package recipe's details (name, version, URL, checksum, description, OPTIONS, and how many pre-built configs exist for it in the repo) without installing anything.
+
+   repo <init|pull|push|status|list> [pkg]
+     Manages the git repo of pre-built packages that 'smith' reads from
+     and writes to (see the OPTIONS section under 'smith' above).
+			init	Creates REPO_DIR as a git repo if it doesn't exist yet, and wires up REPO_REMOTE as its 'origin' if one is configured.
+			pull	Fetches newer pre-built packages from the remote (git pull --ff-only). Requires REPO_REMOTE to be set.
+			push	Pushes any local commits (builds cached with --no-store not used) to the remote. Also happens automatically after each build if REPO_AUTO_PUSH=1.
+			status	Shows the repo path, remote, auto-push setting, and any uncommitted changes.
+			list [pkg]	Lists every cached build, or just those for one package if given, with its version, config id, and the OPTIONS that produced it.
+     REPO_DIR, REPO_REMOTE, and REPO_AUTO_PUSH are set in /etc/forge/forge.conf.
+     Set REPO_GPG_KEY to GPG-sign every commit repo_store makes (a key
+     ID or email gpg already knows about), and REPO_GPG_VERIFY=1 to
+     refuse a cached build whose commit isn't verifiably signed --
+     matters once REPO_REMOTE is shared with a machine/person you
+     don't fully trust the write access to; irrelevant for a purely
+     local, single-user repo.
+EOF
+	;;		
+	smith)
+		if [ -z "$PACKAGE" ]; then
+			msg_error smith_usage
+			exit 1
+		fi
+
+		DRY_RUN=0
+		SMITH_CLEAN=0
+		SMITH_NO_CACHE=0
+		SMITH_NO_STORE=0
+		for ARG in "$@"; do
+			[ "$ARG" = "--dry-run" ] && DRY_RUN=1
+			{ [ "$ARG" = "--clean" ] || [ "$ARG" = "--fresh" ]; } && SMITH_CLEAN=1
+			[ "$ARG" = "--no-cache" ] && SMITH_NO_CACHE=1
+			[ "$ARG" = "--no-store" ] && SMITH_NO_STORE=1
+			[ "$ARG" = "--no-strip" ] && STRIP_BINARIES=0
+			[ "$ARG" = "--keep-la" ] && REMOVE_LA_FILES=0
+		done
+
+		if [ "$DRY_RUN" -eq 0 ] && [ -z "$FORGE_IN_CASCADE" ]; then
+			LOCK_FILE="${FORGE_HOME:+$FORGE_HOME/forge.lock}"
+			LOCK_FILE="${LOCK_FILE:-/var/lock/forge.lock}"
+			mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
+			exec 200>"$LOCK_FILE"
+			if ! flock -n 200; then
+				msg_error lock_exists
+				exit 1
+			fi
+		fi
+						
+		RECIPE=$(resolve_recipe "$PACKAGE")
+		RESOLVE_STATUS=$?
+
+		if [ "$RESOLVE_STATUS" -eq 2 ]; then
+			exit 1
+		elif [ "$RESOLVE_STATUS" -ne 0 ] || [ ! -f "$RECIPE" ]; then
+			msg_error recipe_not_found "$PACKAGE" "$RECIPE_DIR"
+			exit 1
+		fi
+
+		if [ "$DRY_RUN" -eq 1 ]; then
+			msg_header dry_run_start "$PACKAGE"
+		else
+			msg_header smith_start "$PACKAGE"
+		fi
+
+		OPTIONS=()
+		source "$RECIPE"
+
+		NAME="${NAME%$'\r'}"
+		VERSION="${VERSION%$'\r'}"
+		URL="${URL%$'\r'}"
+		GIT_URL="${GIT_URL%$'\r'}"
+		GIT_REF="${GIT_REF%$'\r'}"
+		PKG_FORMAT="${PKG_FORMAT%$'\r'}"
+		load_external_checksum "$NAME"
+
+		if [ -z "$SHA256SUM" ] && [ -z "$MD5SUM" ] && [ -n "$CHECKSUM_URL" ]; then
+			msgln checksum_fetch_attempt "$NAME"
+			if fetch_and_save_checksum "$NAME" "$VERSION" "$CHECKSUM_URL" "$CHECKSUM_ALGO_HINT"; then
+				load_external_checksum "$NAME"
+			fi
+		fi
+
+		if [ ${#DEPS[@]} -gt 0 ]; then
+			CLEAN_DEPS=()
+			for DEP in "${DEPS[@]}"; do
+				CLEAN_DEPS+=("${DEP%$'\r'}")
+			done
+			DEPS=("${CLEAN_DEPS[@]}")
+		fi
+
+		FORCE=$3
+
+		declare -A DEP_VISITED
+		declare -A DEP_DIRECT_DEPS
+		DEP_ORDER=()
+		ROOT_DEP_PKG="$NAME"
+		msgln plan_resolving "$NAME"
+		resolve_dep_tree "$NAME" ""
+
+		TO_INSTALL_DEPS=("${DEP_ORDER[@]:0:${#DEP_ORDER[@]}-1}")
+
+		if [ ${#TO_INSTALL_DEPS[@]} -gt 0 ]; then
+			msg_header plan_header
+			printf '  %s\n' "${TO_INSTALL_DEPS[@]}"
+			msgln plan_count "${#TO_INSTALL_DEPS[@]}"
+
+			if [ "$DRY_RUN" -eq 0 ] && [[ ! "$FORCE" =~ ^(-y|--yes|-f|--force)$ ]]; then
+				read -rp "$(msg plan_confirm)" CONFIRM
+				case "$CONFIRM" in
+					""|[yY][eE][sS]|[yY]) ;;
+					*) msgln plan_aborted; exit 0 ;;
+				esac
+			fi
+
+			if [ "$DRY_RUN" -eq 0 ]; then
+				# Group TO_INSTALL_DEPS into "levels": level(pkg) = 1 +
+				# the highest level among pkg's own deps that are ALSO
+				# in this install batch (0 if none are). Since
+				# TO_INSTALL_DEPS is already topologically ordered
+				# (resolve_dep_tree's post-order), a single left-to-right
+				# pass is enough -- every dep of pkg was already
+				# assigned a level before pkg itself is reached. Same
+				# level = mutually independent = safe to build at the
+				# same time; a package never starts before every level
+				# below its own has fully finished.
+				declare -A DEP_LEVEL
+				MAX_LEVEL=0
+				for PKG_I in "${TO_INSTALL_DEPS[@]}"; do
+					LEVEL_I=0
+					for D_I in ${DEP_DIRECT_DEPS[$PKG_I]:-}; do
+						D_I="${D_I%$'\r'}"
+						[ -z "$D_I" ] && continue
+						if [ -n "${DEP_LEVEL[$D_I]+x}" ] && [ $((DEP_LEVEL[$D_I] + 1)) -gt "$LEVEL_I" ]; then
+							LEVEL_I=$((DEP_LEVEL[$D_I] + 1))
+						fi
+					done
+					DEP_LEVEL[$PKG_I]=$LEVEL_I
+					[ "$LEVEL_I" -gt "$MAX_LEVEL" ] && MAX_LEVEL=$LEVEL_I
+				done
+
+				for ((CASCADE_LVL=0; CASCADE_LVL<=MAX_LEVEL; CASCADE_LVL++)); do
+					LEVEL_PKGS=()
+					for PKG_I in "${TO_INSTALL_DEPS[@]}"; do
+						[ "${DEP_LEVEL[$PKG_I]}" -eq "$CASCADE_LVL" ] && LEVEL_PKGS+=("$PKG_I")
+					done
+					[ ${#LEVEL_PKGS[@]} -eq 0 ] && continue
+
+					if [ "$PARALLEL_DEPS" -eq 1 ] && [ ${#LEVEL_PKGS[@]} -gt 1 ]; then
+						echo "Building ${#LEVEL_PKGS[@]} independent package(s) in parallel (up to $MAX_PARALLEL_JOBS at once): ${LEVEL_PKGS[*]}"
+						declare -A LEVEL_PIDS
+						RUNNING_JOBS=0
+						for PKG_I in "${LEVEL_PKGS[@]}"; do
+							while [ "$RUNNING_JOBS" -ge "$MAX_PARALLEL_JOBS" ]; do
+								wait -n
+								RUNNING_JOBS=$((RUNNING_JOBS - 1))
+							done
+							FORGE_IN_CASCADE=1 "$0" smith "$PKG_I" -y > "${LOG_DIR}/${PKG_I}-cascade.log" 2>&1 &
+							LEVEL_PIDS[$!]="$PKG_I"
+							RUNNING_JOBS=$((RUNNING_JOBS + 1))
+						done
+						LEVEL_FAILED=0
+						for JOB_PID in "${!LEVEL_PIDS[@]}"; do
+							if ! wait "$JOB_PID"; then
+								echo "Error: parallel build of '${LEVEL_PIDS[$JOB_PID]}' failed -- see ${LOG_DIR}/${LEVEL_PIDS[$JOB_PID]}-cascade.log"
+								LEVEL_FAILED=1
+							fi
+						done
+						unset LEVEL_PIDS
+						if [ "$LEVEL_FAILED" -eq 1 ]; then
+							msg_error dep_cascade_failed "(parallel batch: ${LEVEL_PKGS[*]})" "$NAME"
+							exit 1
+						fi
+					else
+						for PKG_I in "${LEVEL_PKGS[@]}"; do
+							if ! FORGE_IN_CASCADE=1 "$0" smith "$PKG_I" -y; then
+								msg_error dep_cascade_failed "$PKG_I" "$NAME"
+								exit 1
+							fi
+						done
+					fi
+				done
+			fi
+		fi
+
+		if [ "$DRY_RUN" -eq 1 ]; then
+			echo ""
+			msgln dry_run_header "$PACKAGE"
+			msgln dry_run_name "$NAME"
+			msgln dry_run_version "$VERSION"
+			msgln dry_run_url "$URL"
+
+			if [ -n "$SHA256SUM" ]; then
+				msgln dry_run_checksum_sha256
+			elif [ -n "$MD5SUM" ]; then
+				msgln dry_run_checksum_md5
+			else
+				msgln dry_run_checksum_none
+			fi
+
+			if [ ${#DEPS[@]} -gt 0 ]; then
+				msgln dry_run_deps "${DEPS[*]}"
+			fi
+
+			EXISTING_MANIFEST="${LOG_DIR}/${NAME}.files"
+			if [ -f "$EXISTING_MANIFEST" ]; then
+				EXISTING_VERSION=$(head -n1 "$EXISTING_MANIFEST" | sed -n 's/^#VERSION=//p')
+				if [ "$EXISTING_VERSION" = "$VERSION" ]; then
+					msgln dry_run_action_already_installed
+				else
+					msgln dry_run_action_upgrade "${EXISTING_VERSION:-unknown}" "$VERSION"
+				fi
+			else
+				msgln dry_run_action_fresh
+			fi
+
+			DRY_ARCHIVE_EXT=$(forge_archive_ext "$URL")
+			TARBALL="$WORKDIR/${NAME}-${VERSION}.${DRY_ARCHIVE_EXT:-tar.gz}"
+			if [ -s "$TARBALL" ]; then
+				msgln dry_run_cached_tarball "$TARBALL"
+			fi
+
+			echo ""
+			msgln dry_run_footer
+			exit 0
+		fi
+
+		# Resolve any OPTIONS the recipe declares (prompting, or reading
+		# --with-<key>/--without-<key> from the command line) and derive
+		# this build's cache key from them plus the recipe's own content.
+		# A recipe with no OPTIONS still gets a cache key (recipe hash
+		# alone), so plain packages are cached too.
+		resolve_options "$@"
+		CONFIG_ID=$(repo_config_id "$RECIPE" "$OPT_STRING")
+		REPO_HIT_TARBALL=""
+		if { [ -n "$URL" ] || [ -n "$GIT_URL" ]; } && [ "$SMITH_NO_CACHE" -ne 1 ] && [ "$SMITH_CLEAN" -ne 1 ]; then
+			REPO_HIT_TARBALL=$(repo_lookup "$NAME" "$VERSION" "$CONFIG_ID")
+		fi
+
+		SRC_DIR="$WORKDIR/src-${NAME}"
+		PKG_DIR="$WORKDIR/pkg-${NAME}"
+		EXTRA_DIR="$WORKDIR"
+		RESUME_MARKER="$SRC_DIR/.forge-build-version"
+
+		RESUME=0
+		if [ "$SMITH_CLEAN" -eq 1 ]; then
+			rm -rf "$SRC_DIR" "$PKG_DIR"
+		elif [ -d "$SRC_DIR" ] && [ -f "$RESUME_MARKER" ] && [ "$(cat "$RESUME_MARKER" 2>/dev/null)" = "$VERSION" ]; then
+			msgln resume_found "${NAME}-${VERSION}" "$SRC_DIR"
+			msgln resume_hint "$PACKAGE"
+			RESUME=1
+		else
+			rm -rf "$SRC_DIR" "$PKG_DIR"
+		fi
+		mkdir -p "$SRC_DIR" "$PKG_DIR"
+		mkdir -p "$LOG_DIR"
+		echo "$VERSION" > "$RESUME_MARKER"
+
+		if [ -z "$URL" ] && [ -z "$GIT_URL" ]; then
+			# Meta-package: no tarball (or git repo) of its own. Either a
+			# pure grouping package (DEPS only, e.g. "xorg-libraries"
+			# depending on every individual Xorg lib recipe) or one
+			# whose mold() does its own downloading in a loop (the
+			# book's own pattern for pages like "Xorg Libraries",
+			# which list a directory + a checksums file instead of a
+			# single tarball). No staging, no DESTDIR, no per-file
+			# manifest -- mold()/smith() (if defined at all) are fully
+			# self-contained and run directly against the real system,
+			# same as finish(). melt for a meta-package only removes
+			# its version marker, not files, since Forge has no way to
+			# know what a self-contained script created.
+			mkdir -p "$SRC_DIR" "$LOG_DIR"
+			cd "$SRC_DIR" || exit 1
+			BUILD_LOG="${LOG_DIR}/${NAME}-build.log"
+			: > "$BUILD_LOG"
+
+			if [ "$(type -t heat)" = "function" ]; then
+				ui_header "Heating $NAME (configuring)..."
+				heat 2>&1 | tee -a "$BUILD_LOG" | forge_progress_filter "Configuring"
+				HEAT_STATUS=${PIPESTATUS[0]}
+				if [ "$HEAT_STATUS" -ne 0 ]; then
+					echo "Error: heat() for ${NAME}-${VERSION} failed, see $BUILD_LOG"
+					exit 1
+				fi
+			fi
+			if [ "$(type -t mold)" = "function" ]; then
+				msg_header molding
+				mold 2>&1 | tee -a "$BUILD_LOG" | forge_progress_filter "Building"
+				MOLD_STATUS=${PIPESTATUS[0]}
+				if [ "$MOLD_STATUS" -ne 0 ]; then
+					msg_error mold_failed "${NAME}-${VERSION}" "$BUILD_LOG"
+					exit 1
+				fi
+			fi
+			if [ "$(type -t smith)" = "function" ]; then
+				msg_header smithing_isolated
+				smith "$INSTALL_ROOT" 2>&1 | tee -a "$BUILD_LOG" | forge_progress_filter "Installing"
+				SMITH_STATUS=${PIPESTATUS[0]}
+				if [ "$SMITH_STATUS" -ne 0 ]; then
+					msg_error smith_failed "${NAME}-${VERSION}" "$BUILD_LOG"
+					exit 1
+				fi
+			fi
+			if [ "$(type -t finish)" = "function" ]; then
+				msgln running_finish
+				if ! finish; then
+					msg_warn finish_warning
+				fi
+			fi
+
+			OLD_REASON=""
+			[ -f "${LOG_DIR}/${NAME}.files" ] && OLD_REASON=$(grep '^#REASON=' "${LOG_DIR}/${NAME}.files" 2>/dev/null | cut -d= -f2)
+			if [ -n "$FORGE_IN_CASCADE" ] && [ "$OLD_REASON" != "explicit" ]; then
+				INSTALL_REASON="dependency"
+			else
+				INSTALL_REASON="explicit"
+			fi
+			{
+				echo "#VERSION=${VERSION}"
+				echo "#REASON=${INSTALL_REASON}"
+			} > "${LOG_DIR}/${NAME}.files"
+			forge_log_history "INSTALL" "$NAME" "$VERSION"
+			rm -rf "$SRC_DIR"
+			trap - INT TERM
+			msg_ok smithed_success "$NAME" "$VERSION"
+			exit 0
+		fi
+
+		TARBALL=""
+		if [ -z "$GIT_URL" ]; then
+			ARCHIVE_EXT=$(forge_archive_ext "$URL")
+			if [ -z "$ARCHIVE_EXT" ]; then
+				msg_error archive_unrecognized "$URL"
+				exit 1
+			fi
+			TARBALL="$WORKDIR/${NAME}-${VERSION}.${ARCHIVE_EXT}"
+		fi
+
+		cleanup_on_interrupt() {
+			echo ""
+			msgln interrupted "$SRC_DIR"
+			msgln interrupted_hint "$PACKAGE"
+			exit 130
+		}
+		trap cleanup_on_interrupt INT TERM
+				
+		EXISTING_MANIFEST="${LOG_DIR}/${NAME}.files"
+		FORCE=$3
+
+		if [ -f "$EXISTING_MANIFEST" ]; then
+			EXISTING_VERSION=$(head -n1 "$EXISTING_MANIFEST" | sed -n 's/^#VERSION=//p')
+
+			if [ "$EXISTING_VERSION" = "$VERSION" ]; then
+				msgln already_installed "$NAME" "$VERSION"
+				if [[ "$FORCE" =~ ^(-f|--force)$ ]]; then
+					msgln forcing_reinstall
+				elif [[ "$FORCE" =~ ^(-y|--yes)$ ]]; then
+					msgln nothing_to_do
+					exit 0
+				else
+					read -rp "$(msg prompt_reinstall)" CONFIRM
+					case "$CONFIRM" in
+						[yY][eE][sS]|[yY]) ;;
+						*) msgln reinstall_aborted; exit 0 ;;
+					esac
+				fi
+			else
+				msgln currently_installed_upgrading "$NAME" "${EXISTING_VERSION:-unknown}" "$VERSION"
+				if [[ ! "$FORCE" =~ ^(-y|--yes|-f|--force)$ ]]; then
+					read -rp "$(msg prompt_upgrade "$VERSION")" CONFIRM
+					case "$CONFIRM" in
+						[yY][eE][sS]|[yY]) ;;
+						*) msgln upgrade_aborted; exit 0 ;;
+					esac
+				fi
+			fi
+		else
+			msgln not_installed "$NAME"
+			if [[ ! "$FORCE" =~ ^(-y|--yes|-f|--force)$ ]]; then
+				read -rp "$(msg prompt_smith "$NAME" "$VERSION")" CONFIRM
+				case "$CONFIRM" in
+					[yY][eE][sS]|[yY]) ;;
+					*) msgln smith_aborted; exit 0 ;;
+				esac
+			fi
+		fi
+		
+		BUILD_LOG="${LOG_DIR}/${NAME}-build.log"
+		: > "$BUILD_LOG"
+
+		if [ -n "$REPO_HIT_TARBALL" ]; then
+			echo "Found a pre-built '${NAME}' ${VERSION} in the repo (config ${CONFIG_ID}${OPT_STRING:+, options: $OPT_STRING}) -- skipping download and mold()."
+			rm -rf "$PKG_DIR"
+			mkdir -p "$PKG_DIR"
+			if ! tar -C "$PKG_DIR" -xJf "$REPO_HIT_TARBALL"; then
+				echo "Warning: failed to extract the cached build ($REPO_HIT_TARBALL) -- building from source instead."
+				REPO_HIT_TARBALL=""
+			fi
+		elif [ -n "$PKG_FORMAT" ]; then
+			# A foreign binary package (pacman/.deb) -- there's nothing to
+			# heat()/mold()/smith() here, the package IS already built;
+			# just fetch it and let the format-specific installer stage
+			# it into PKG_DIR directly, same role PKG_DIR always has.
+			if [ "$RESUME" -eq 1 ] && [ -s "$TARBALL" ]; then
+				echo "Reusing already-downloaded package file: $TARBALL"
+			else
+				if [ -n "$SHA256SUM" ]; then
+					CHECKSUM_ALGO="sha256sum"; EXPECTED_SUM="$SHA256SUM"
+				elif [ -n "$MD5SUM" ]; then
+					CHECKSUM_ALGO="md5sum"; EXPECTED_SUM="$MD5SUM"
+				fi
+				[ -z "$EXPECTED_SUM" ] && msg_warn no_checksum_warning "$NAME"
+				if ! forge_get_file "$URL" "$TARBALL" "$EXPECTED_SUM" "$CHECKSUM_ALGO"; then
+					exit 1
+				fi
+			fi
+
+			rm -rf "$PKG_DIR"
+			case "$PKG_FORMAT" in
+				pacman) PKG_FORMAT_VERSION=$(forge_install_pacman_pkg "$TARBALL" "$PKG_DIR") ;;
+				deb)    PKG_FORMAT_VERSION=$(forge_install_deb_pkg "$TARBALL" "$PKG_DIR") ;;
+				*)
+					echo "Error: unknown PKG_FORMAT '$PKG_FORMAT' -- expected 'pacman' or 'deb'."
+					exit 1
+					;;
+			esac
+			if [ ! -d "$PKG_DIR" ] || [ -z "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
+				echo "Error: extracting the $PKG_FORMAT package produced no files -- see any error above."
+				exit 1
+			fi
+			if [ -n "$PKG_FORMAT_VERSION" ] && [ "$PKG_FORMAT_VERSION" != "$VERSION" ]; then
+				echo "Note: using the package's own version ($PKG_FORMAT_VERSION) instead of the recipe's VERSION ($VERSION)."
+				VERSION="$PKG_FORMAT_VERSION"
+			fi
+
+			forge_clean_pkg_dir "$PKG_DIR"
+			if [ "$SMITH_NO_STORE" -ne 1 ]; then
+				repo_store "$NAME" "$VERSION" "$CONFIG_ID" "$PKG_DIR" "$OPT_STRING"
+			fi
+		fi
+
+		if [ -z "$REPO_HIT_TARBALL" ] && [ -z "$PKG_FORMAT" ]; then
+			if [ "$RESUME" -eq 1 ]; then
+				msgln skip_download_resume
+			elif [ -n "$GIT_URL" ]; then
+				echo "Cloning ${GIT_URL}${GIT_REF:+ (ref: $GIT_REF)}..."
+				GIT_CLONE_ARGS=(--depth 1)
+				[ -n "$GIT_REF" ] && GIT_CLONE_ARGS+=(--branch "$GIT_REF")
+				rm -rf "$SRC_DIR"
+				if ! git clone "${GIT_CLONE_ARGS[@]}" "$GIT_URL" "$SRC_DIR"; then
+					echo "Error: git clone of $GIT_URL failed${GIT_REF:+ (ref: $GIT_REF)}."
+					exit 1
+				fi
+
+				if [ ${#EXTRA_FILES[@]} -gt 0 ]; then
+					msgln extra_file_header "$NAME"
+					mkdir -p "$EXTRA_DIR"
+					for ENTRY in "${EXTRA_FILES[@]}"; do
+						ENTRY="${ENTRY%$'\r'}"
+						EXTRA_URL="${ENTRY%%::*}"
+						EXTRA_SUM=""
+						EXTRA_ALGO=""
+						if [[ "$ENTRY" == *"::"* ]]; then
+							EXTRA_SUM="${ENTRY#*::}"
+							EXTRA_ALGO="sha256sum"
+							[ "${#EXTRA_SUM}" -eq 32 ] && EXTRA_ALGO="md5sum"
+						fi
+						EXTRA_DEST="$EXTRA_DIR/$(basename "$EXTRA_URL")"
+						if ! forge_get_file "$EXTRA_URL" "$EXTRA_DEST" "$EXTRA_SUM" "$EXTRA_ALGO"; then
+							msg_error extra_file_failed "$NAME"
+							exit 1
+						fi
+					done
+				fi
+			else
+				if [ -n "$SHA256SUM" ]; then
+					CHECKSUM_ALGO="sha256sum"
+					EXPECTED_SUM="$SHA256SUM"
+				elif [ -n "$MD5SUM" ]; then
+					CHECKSUM_ALGO="md5sum"
+					EXPECTED_SUM="$MD5SUM"
+				fi
+
+				GET_COUNTER=1
+				if [ -z "$EXPECTED_SUM" ]; then
+					msg_warn no_checksum_warning "$NAME"
+				fi
+				if ! forge_get_file "$URL" "$TARBALL" "$EXPECTED_SUM" "$CHECKSUM_ALGO"; then
+					exit 1
+				fi
+
+				if [ ${#EXTRA_FILES[@]} -gt 0 ]; then
+					msgln extra_file_header "$NAME"
+					mkdir -p "$EXTRA_DIR"
+					for ENTRY in "${EXTRA_FILES[@]}"; do
+						ENTRY="${ENTRY%$'\r'}"
+						EXTRA_URL="${ENTRY%%::*}"
+						EXTRA_SUM=""
+						EXTRA_ALGO=""
+						if [[ "$ENTRY" == *"::"* ]]; then
+							EXTRA_SUM="${ENTRY#*::}"
+							EXTRA_ALGO="sha256sum"
+							[ "${#EXTRA_SUM}" -eq 32 ] && EXTRA_ALGO="md5sum"
+						fi
+						EXTRA_DEST="$EXTRA_DIR/$(basename "$EXTRA_URL")"
+						if ! forge_get_file "$EXTRA_URL" "$EXTRA_DEST" "$EXTRA_SUM" "$EXTRA_ALGO"; then
+							msg_error extra_file_failed "$NAME"
+							exit 1
+						fi
+					done
+				fi
+
+				forge_extract_archive "$TARBALL" "$SRC_DIR"
+				if [ $? -ne 0 ]; then
+					msg_error extract_failed "$TARBALL"
+					exit 1
+				fi
+			fi
+			cd "$SRC_DIR" || exit 1
+
+			HEAT_DONE_MARKER="$SRC_DIR/.forge-heat-done"
+			MOLD_DONE_MARKER="$SRC_DIR/.forge-mold-done"
+
+			if [ "$(type -t heat)" = "function" ]; then
+				if [ "$RESUME" -eq 1 ] && [ -f "$HEAT_DONE_MARKER" ]; then
+					ui_header "Skipping heat() for $NAME (already configured)"
+				else
+					ui_header "Heating $NAME (configuring)..."
+					heat 2>&1 | tee -a "$BUILD_LOG" | forge_progress_filter "Configuring"
+					HEAT_STATUS=${PIPESTATUS[0]}
+					if [ "$HEAT_STATUS" -ne 0 ]; then
+						echo "Error: heat() for ${NAME}-${VERSION} failed, see $BUILD_LOG"
+						exit 1
+					fi
+					touch "$HEAT_DONE_MARKER"
+				fi
+			fi
+
+			if [ "$RESUME" -eq 1 ] && [ -f "$MOLD_DONE_MARKER" ]; then
+				msgln mold_skip
+			else
+				msg_header molding
+				mold 2>&1 | tee -a "$BUILD_LOG" | forge_progress_filter "Building"
+				MOLD_STATUS=${PIPESTATUS[0]}
+				if [ "$MOLD_STATUS" -ne 0 ]; then
+					msg_error mold_failed "${NAME}-${VERSION}" "$BUILD_LOG"
+					exit 1
+				fi
+				touch "$MOLD_DONE_MARKER"
+			fi
+
+			msg_header smithing_isolated
+			smith "$PKG_DIR" 2>&1 | tee -a "$BUILD_LOG" | forge_progress_filter "Installing"
+			SMITH_STATUS=${PIPESTATUS[0]}
+			if [ "$SMITH_STATUS" -ne 0 ]; then
+				msg_error smith_failed "${NAME}-${VERSION}" "$BUILD_LOG"
+				exit 1
+			fi
+
+			# Everything smith() (make/ninja install, staged via DESTDIR
+			# into PKG_DIR) needed from the extracted source/build tree,
+			# it already used. Nothing past this point reads SRC_DIR again
+			# -- manifest generation, cleanup, caching, and the final copy
+			# to the real filesystem all work from PKG_DIR -- so for a
+			# package like LLVM, whose build directory alone can be
+			# several times the size of the actual install, there's no
+			# reason to keep dragging that around for the rest of the run.
+			rm -rf "$SRC_DIR"
+
+			forge_clean_pkg_dir "$PKG_DIR"
+
+			if [ "$SMITH_NO_STORE" -ne 1 ]; then
+				repo_store "$NAME" "$VERSION" "$CONFIG_ID" "$PKG_DIR" "$OPT_STRING"
+			fi
+		fi
+
+		msgln generating_manifest
+		OLD_REASON=""
+		[ -f "${LOG_DIR}/${NAME}.files" ] && OLD_REASON=$(grep '^#REASON=' "${LOG_DIR}/${NAME}.files" 2>/dev/null | cut -d= -f2)
+		if [ -n "$FORGE_IN_CASCADE" ] && [ "$OLD_REASON" != "explicit" ]; then
+			INSTALL_REASON="dependency"
+		else
+			INSTALL_REASON="explicit"
+		fi
+		cd "$PKG_DIR" || exit 1
+		{
+			echo "#VERSION=${VERSION}"
+			echo "#REASON=${INSTALL_REASON}"
+			find . -mindepth 1 -depth
+		} > "${LOG_DIR}/${NAME}.files"
+		
+		msg_header installing_files
+		mkdir -p "$INSTALL_ROOT"
+		cp -rvp "$PKG_DIR"/* "$INSTALL_ROOT"/
+
+		forge_run_hooks "${LOG_DIR}/${NAME}.files"
+
+		if [ "$(type -t finish)" = "function" ]; then
+			msgln running_finish
+			if ! finish; then
+				msg_warn finish_warning
+			fi
+		fi
+		
+		forge_log_history "INSTALL" "$NAME" "$VERSION"
+		rm -rf "$SRC_DIR" "$PKG_DIR" "$TARBALL"
+		trap - INT TERM
+		msg_ok smithed_success "$NAME" "$VERSION"
+		;;
+	assay)
+		if [ -z "$PACKAGE" ]; then
+			echo "Error: Specify the package to assay, e.g. 'forge assay foo'"
+			exit 1
+		fi
+
+		RECIPE=$(resolve_recipe "$PACKAGE")
+		RESOLVE_STATUS=$?
+
+		if [ "$RESOLVE_STATUS" -eq 2 ]; then
+			exit 1
+		elif [ "$RESOLVE_STATUS" -ne 0 ] || [ ! -f "$RECIPE" ]; then
+			echo "Error: Recipe for '$PACKAGE' not found on $RECIPE_DIR"
+			exit 1
+		fi
+
+		echo "Assaying recipe: $PACKAGE..."
+		ISSUES=0
+
+		if grep -q $'\r' "$RECIPE" 2>/dev/null; then
+			echo "	[WARN] Recipe has CRLF line endings (Windows-style). Fix with: sed -i 's/\\r\$//' \"$RECIPE\""
+		fi
+
+		source "$RECIPE"
+
+		NAME="${NAME%$'\r'}"
+		VERSION="${VERSION%$'\r'}"
+		URL="${URL%$'\r'}"
+		GIT_URL="${GIT_URL%$'\r'}"
+		GIT_REF="${GIT_REF%$'\r'}"
+		PKG_FORMAT="${PKG_FORMAT%$'\r'}"
+		SHA256SUM="${SHA256SUM%$'\r'}"
+		MD5SUM="${MD5SUM%$'\r'}"
+		load_external_checksum "$NAME"
+
+		if [ -z "$NAME" ]; then
+			echo "	[FAIL] NAME is not defined."
+			ISSUES=$((ISSUES+1))
+		fi
+		if [ -z "$VERSION" ]; then
+			echo "	[FAIL] VERSION is not defined."
+			ISSUES=$((ISSUES+1))
+		fi
+		if [ -n "$URL" ] && [ -n "$GIT_URL" ]; then
+			echo "	[WARN] Both URL and GIT_URL are defined -- GIT_URL takes priority at build time (URL is ignored)."
+		elif [ -n "$GIT_URL" ]; then
+			echo "	[INFO] GIT_URL is defined; sourced via 'git clone' instead of a tarball download.${GIT_REF:+ Ref: $GIT_REF.}"
+		elif [ -n "$PKG_FORMAT" ]; then
+			case "$PKG_FORMAT" in
+				pacman|deb) echo "	[INFO] PKG_FORMAT=$PKG_FORMAT; URL is downloaded and extracted as a foreign binary package, not built -- heat()/mold()/smith() aren't called for this recipe." ;;
+				*) echo "	[FAIL] PKG_FORMAT='$PKG_FORMAT' isn't recognized -- must be 'pacman' or 'deb'."; ISSUES=$((ISSUES+1)) ;;
+			esac
+		elif [ -z "$URL" ]; then
+			echo "	[INFO] No URL or GIT_URL defined; treated as a meta-package -- mold()/smith() (if defined) run directly against the real system with no download."
+		fi
+		if [ "$(type -t heat)" != "function" ] && [ -z "$PKG_FORMAT" ]; then
+			echo "	[WARN] heat() is not defined; recipes generated by newer 'sketch' always define one (even if just a no-op note) so a resumed build never silently skips reconfiguring."
+		fi
+		if [ "$(type -t mold)" != "function" ] && [ -z "$PKG_FORMAT" ]; then
+			echo "	[FAIL] mold() function is not defined."
+			ISSUES=$((ISSUES+1))
+		fi
+		if [ "$(type -t smith)" != "function" ] && [ -z "$PKG_FORMAT" ]; then
+			echo "	[FAIL] smith() function is not defined."
+			ISSUES=$((ISSUES+1))
+		fi
+		if [ "$(type -t finish)" = "function" ]; then
+			echo "	[INFO] finish() is defined; will run after real-system install."
+		fi
+		if [ -z "$SHA256SUM" ] && [ -z "$MD5SUM" ]; then
+			echo "	[WARN] No SHA256SUM or MD5SUM defined; download integrity will not be verified."
+		fi
+		if [ -n "$SHA256SUM" ] && ! [[ "$SHA256SUM" =~ ^[0-9a-fA-F]{64}$ ]]; then
+			echo "	[WARN] SHA256SUM does not look like a valid 64-character hex hash (check for a stray space, truncation, or extra character)."
+		fi
+		if [ -n "$MD5SUM" ] && ! [[ "$MD5SUM" =~ ^[0-9a-fA-F]{32}$ ]]; then
+			echo "	[WARN] MD5SUM does not look like a valid 32-character hex hash (check for a stray space, truncation, or extra character)."
+		fi
+		if [ ${#DEPS[@]} -gt 0 ]; then
+			for DEP in "${DEPS[@]}"; do
+				DEP="${DEP%$'\r'}"
+				DEP_RECIPE=$(resolve_recipe "$DEP")
+				if [ $? -ne 0 ] || [ ! -f "$DEP_RECIPE" ]; then
+					echo "	[FAIL] Dependency '$DEP' has no recipe anywhere under $RECIPE_DIR"
+					ISSUES=$((ISSUES+1))
+				fi
+			done
+		fi
+
+		if [ -n "$VERSION_CHECK_URL" ] && [ -z "$VERSION_REGEX" ]; then
+			echo "	[WARN] VERSION_CHECK_URL is set but VERSION_REGEX is missing; 'forge probe' will skip this recipe."
+		fi
+		if [ -z "$VERSION_CHECK_URL" ] && [ -n "$VERSION_REGEX" ]; then
+			echo "	[WARN] VERSION_REGEX is set but VERSION_CHECK_URL is missing; 'forge probe' will skip this recipe."
+		fi
+
+		if [ "$ISSUES" -eq 0 ]; then
+			echo "Recipe '$PACKAGE' passed assay with no critical issues."
+		else
+			echo "Recipe '$PACKAGE' failed assay with $ISSUES issue(s)."
+			exit 1
+		fi
+		;;
+	probe)
+		if [ -z "$PACKAGE" ]; then
+			echo "Error: Specify the package to probe, e.g. 'forge probe foo', or 'forge probe --all'"
+			exit 1
+		fi
+
+		PROBE_UPDATE=0
+		PROBE_YES=0
+		for ARG in "$@"; do
+			case "$ARG" in
+				--update) PROBE_UPDATE=1 ;;
+				-y|--yes) PROBE_YES=1 ;;
+			esac
+		done
+
+		if [ "$PACKAGE" = "--all" ]; then
+			echo "Probing all recipes with VERSION_CHECK_URL defined..."
+			echo ""
+			TO_UPDATE_RECIPES=()
+			while IFS= read -r RECIPE_FILE; do
+				[ -e "$RECIPE_FILE" ] || continue
+				probe_one "$RECIPE_FILE"
+				PROBE_STATUS=$?
+				if [ "$PROBE_STATUS" -eq 3 ]; then
+					TO_UPDATE_RECIPES+=("${PROBE_RESULT_RECIPE}|${PROBE_RESULT_NAME}|${PROBE_RESULT_NEW}|${PROBE_RESULT_CHECKSUM_URL}|${PROBE_RESULT_CHECKSUM_ALGO_HINT}")
+				fi
+			done < <(find "$RECIPE_DIR" -type f -name "*.sh" | sort)
+
+			if [ "$PROBE_UPDATE" -eq 0 ]; then
+				exit 0
+			fi
+
+			if [ ${#TO_UPDATE_RECIPES[@]} -eq 0 ]; then
+				echo ""
+				echo "Nothing to update."
+				exit 0
+			fi
+
+			if [ "$PROBE_YES" -eq 0 ]; then
+				echo ""
+				read -rp "Update ${#TO_UPDATE_RECIPES[@]} recipe(s) with new versions/checksums? [y/N] " CONFIRM
+				case "$CONFIRM" in
+					[yY][eE][sS]|[yY]) ;;
+					*) echo "Probe --update aborted."; exit 0 ;;
+				esac
+			fi
+
+			echo ""
+			for ENTRY in "${TO_UPDATE_RECIPES[@]}"; do
+				IFS='|' read -r R_RECIPE R_NAME R_NEW R_CKURL R_ALGOHINT <<< "$ENTRY"
+				probe_apply_update "$R_RECIPE" "$R_NAME" "$R_NEW" "$R_CKURL" "$R_ALGOHINT"
+			done
+			echo ""
+			echo "Done. Run 'forge temper --all' to install the new versions."
+			exit 0
+		fi
+
+		RECIPE=$(resolve_recipe "$PACKAGE")
+		RESOLVE_STATUS=$?
+		if [ "$RESOLVE_STATUS" -eq 2 ]; then
+			exit 1
+		elif [ "$RESOLVE_STATUS" -ne 0 ] || [ ! -f "$RECIPE" ]; then
+			echo "Error: Recipe for '$PACKAGE' not found on $RECIPE_DIR"
+			exit 1
+		fi
+
+		probe_one "$RECIPE"
+		PROBE_STATUS=$?
+
+		if [ "$PROBE_STATUS" -eq 3 ] && [ "$PROBE_UPDATE" -eq 1 ]; then
+			if [ "$PROBE_YES" -eq 0 ]; then
+				read -rp "Update recipe to $PROBE_RESULT_NEW and refresh checksum? [y/N] " CONFIRM
+				case "$CONFIRM" in
+					[yY][eE][sS]|[yY]) ;;
+					*) echo "Probe --update aborted."; exit 0 ;;
+				esac
+			fi
+			probe_apply_update "$PROBE_RESULT_RECIPE" "$PROBE_RESULT_NAME" "$PROBE_RESULT_NEW" "$PROBE_RESULT_CHECKSUM_URL" "$PROBE_RESULT_CHECKSUM_ALGO_HINT"
+			echo "Run 'forge temper $PROBE_RESULT_NAME' to install the new version."
+		fi
+		;;
+	sketch)
+		if [ -z "$PACKAGE" ]; then
+			echo "Error: Specify the package to sketch, e.g. 'forge sketch expat'"
+			exit 1
+		fi
+
+		SKETCH_BOOK=""
+		SKETCH_BOOK_EXPLICIT=""
+		SKETCH_URL=""
+		SKETCH_CATEGORY=""
+		SKETCH_FORCE=0
+		SKETCH_REF=""
+		SKETCH_ARGS=("$@")
+		SKI=0
+		while [ "$SKI" -lt ${#SKETCH_ARGS[@]} ]; do
+			case "${SKETCH_ARGS[$SKI]}" in
+				--source|-s|--book) SKI=$((SKI+1)); SKETCH_BOOK="${SKETCH_ARGS[$SKI]}"; SKETCH_BOOK_EXPLICIT=1 ;;
+				--url) SKI=$((SKI+1)); SKETCH_URL="${SKETCH_ARGS[$SKI]}" ;;
+				--ref) SKI=$((SKI+1)); SKETCH_REF="${SKETCH_ARGS[$SKI]}" ;;
+				--category) SKI=$((SKI+1)); SKETCH_CATEGORY="${SKETCH_ARGS[$SKI]}" ;;
+				--force|-f) SKETCH_FORCE=1 ;;
+			esac
+			SKI=$((SKI+1))
+		done
+
+		if [ "$SKETCH_BOOK" = "git" ] && [ -z "$SKETCH_URL" ]; then
+			echo "Error: --source git needs --url <git repo URL> -- there's no index to search a git repo by name."
+			exit 1
+		fi
+
+		if { [ "$SKETCH_BOOK" = "pacman" ] || [ "$SKETCH_BOOK" = "apt" ]; } && [ -z "$SKETCH_URL" ]; then
+			echo "Looking up '$PACKAGE' (local index first, then $([ "$SKETCH_BOOK" = "pacman" ] && echo "$PACMAN_MIRROR" || echo "$APT_MIRROR") if needed)..."
+			if [ "$SKETCH_BOOK" = "pacman" ]; then
+				SK_PM_RESULT=$(sketch_pacman_lookup "$PACKAGE")
+			else
+				SK_PM_RESULT=$(sketch_apt_lookup "$PACKAGE")
+			fi
+			if [ -z "$SK_PM_RESULT" ]; then
+				echo "Error: '$PACKAGE' not found -- checked the local index and the configured mirror."
+				if [ "$SKETCH_BOOK" = "pacman" ]; then
+					echo "Confirm the name is right (pacman is exact-match on %NAME%), or that PACMAN_MIRROR/PACMAN_REPOS (forge.conf) actually carry it."
+				else
+					echo "Confirm the name is right (apt is exact-match on Package:), or that APT_MIRROR/APT_SUITE/APT_COMPONENTS (forge.conf) actually carry it."
+				fi
+				exit 1
+			fi
+			SKETCH_URL=$(printf '%s' "$SK_PM_RESULT" | cut -f1)
+			echo "Found: $SKETCH_URL"
+		fi
+
+		if [ -z "$SKETCH_URL" ]; then
+			SKETCH_SUGGESTIONS=()
+			if [ -n "$SKETCH_BOOK_EXPLICIT" ]; then
+				case "$SKETCH_BOOK" in
+					lfs)   SKETCH_BOOKS_TO_TRY=("lfs:$LFS_BOOK_INDEX_URL") ;;
+					blfs)  SKETCH_BOOKS_TO_TRY=("blfs:$BLFS_BOOK_INDEX_URL") ;;
+					slfs)  SKETCH_BOOKS_TO_TRY=("slfs:$SLFS_BOOK_INDEX_URL") ;;
+					glfs)  SKETCH_BOOKS_TO_TRY=("glfs:$GLFS_BOOK_INDEX_URL") ;;
+					mlfs)  SKETCH_BOOKS_TO_TRY=("mlfs:$MLFS_BOOK_INDEX_URL") ;;
+					gnome) SKETCH_BOOKS_TO_TRY=("gnome:gnome") ;;
+					*) echo "Error: --source must be 'lfs', 'blfs', 'slfs', 'glfs', 'mlfs', 'gnome', 'git' (also needs --url), 'pacman', or 'apt'"; exit 1 ;;
+				esac
+			else
+				# No --source given: search across all six, in the order
+				# a BLFS-heavy Forge setup is most likely to need them.
+				# "gnome" goes last -- it's a raw tarball listing with no
+				# build instructions to scrape (see the generic
+				# build-system detection below), so a book page is
+				# always preferable when one actually documents the
+				# package.
+				SKETCH_BOOKS_TO_TRY=("blfs:$BLFS_BOOK_INDEX_URL" "slfs:$SLFS_BOOK_INDEX_URL" "glfs:$GLFS_BOOK_INDEX_URL" "mlfs:$MLFS_BOOK_INDEX_URL" "lfs:$LFS_BOOK_INDEX_URL" "gnome:gnome")
+			fi
+
+			for SKETCH_BOOK_ENTRY in "${SKETCH_BOOKS_TO_TRY[@]}"; do
+				SKETCH_BOOK="${SKETCH_BOOK_ENTRY%%:*}"
+				SKETCH_INDEX_URL="${SKETCH_BOOK_ENTRY#*:}"
+				if [ "$SKETCH_BOOK" = "gnome" ]; then
+					echo "Looking up '$PACKAGE' on download.gnome.org/sources..."
+					SK_GNOME_METADATA=$(sketch_gnome_lookup "$PACKAGE")
+					if [ -n "$SK_GNOME_METADATA" ]; then
+						SKETCH_URL="https://download.gnome.org/sources/${PACKAGE}/"
+						break
+					fi
+					continue
+				fi
+				echo "Looking up '$PACKAGE' in the $SKETCH_BOOK index ($SKETCH_INDEX_URL)..."
+				SKETCH_URL=$(sketch_find_book_page "$SKETCH_INDEX_URL" "$PACKAGE" "$SKETCH_BOOK")
+				[ -n "$SKETCH_URL" ] && break
+			done
+
+			if [ -z "$SKETCH_URL" ]; then
+				SKETCH_TRIED_NAMES=()
+				for SKETCH_BOOK_ENTRY in "${SKETCH_BOOKS_TO_TRY[@]}"; do
+					SKETCH_TRIED_NAMES+=("${SKETCH_BOOK_ENTRY%%:*}")
+				done
+				echo "Error: '$PACKAGE' not found in ${SKETCH_TRIED_NAMES[*]}."
+				if [ ${#SKETCH_SUGGESTIONS[@]} -gt 0 ]; then
+					echo "Did you mean one of these?"
+					printf '%s\n' "${SKETCH_SUGGESTIONS[@]}" | sort -u | sed 's/^/  /'
+				fi
+				echo "Try 'forge sketch $PACKAGE --url <direct link to the package's page, or straight to a tarball>'."
+				exit 1
+			fi
+			echo "Found: $SKETCH_URL"
+		fi
+
+		RECIPE_TARGET="${RECIPE_DIR}/${SKETCH_CATEGORY:+$SKETCH_CATEGORY/}${PACKAGE}.sh"
+		if [ -f "$RECIPE_TARGET" ] && [ "$SKETCH_FORCE" -ne 1 ]; then
+			echo "Error: a recipe already exists at $RECIPE_TARGET. Use --force to overwrite it."
+			exit 1
+		fi
+
+		SKETCH_IS_TARBALL=0
+		case "$SKETCH_URL" in
+			*.tar.gz|*.tar.xz|*.tar.bz2|*.tar.zst|*.tgz|*.txz|*.tbz2|*.zip) SKETCH_IS_TARBALL=1 ;;
+		esac
+
+		SKETCH_PKG_FORMAT=""
+		case "$SKETCH_URL" in
+			*.pkg.tar.zst|*.pkg.tar.xz|*.pkg.tar.gz) SKETCH_PKG_FORMAT="pacman" ;;
+			*.deb) SKETCH_PKG_FORMAT="deb" ;;
+		esac
+
+		if [ -n "$SKETCH_PKG_FORMAT" ]; then
+			echo "'--url' points at a $SKETCH_PKG_FORMAT package -- downloading it to read its own version, no build needed."
+			SK_PEEK_PKG="${WORKDIR}/.sketch-peek-pkg-$$"
+			SK_PEEK_DIR="${WORKDIR}/.sketch-peek-pkgdir-$$"
+			mkdir -p "$WORKDIR"
+			if ! wget -qO "$SK_PEEK_PKG" "$SKETCH_URL"; then
+				echo "Error: failed to download $SKETCH_URL"
+				rm -f "$SK_PEEK_PKG"
+				exit 1
+			fi
+			rm -rf "$SK_PEEK_DIR"
+			case "$SKETCH_PKG_FORMAT" in
+				pacman) SK_VERSION=$(forge_install_pacman_pkg "$SK_PEEK_PKG" "$SK_PEEK_DIR") ;;
+				deb)    SK_VERSION=$(forge_install_deb_pkg "$SK_PEEK_PKG" "$SK_PEEK_DIR") ;;
+			esac
+			rm -rf "$SK_PEEK_PKG" "$SK_PEEK_DIR"
+			if [ -z "$SK_VERSION" ]; then
+				echo "Warning: couldn't read a version from the package's own metadata -- add VERSION by hand."
+				SK_VERSION="0"
+			fi
+
+			{
+				echo "NAME=\"${PACKAGE}\""
+				echo "VERSION=\"${SK_VERSION}\""
+				echo "URL=\"${SKETCH_URL}\""
+				echo "PKG_FORMAT=\"${SKETCH_PKG_FORMAT}\""
+				echo ""
+				echo "# PKG_FORMAT recipes install a ready-made binary package"
+				echo "# directly -- no heat()/mold()/smith() needed or called."
+			} > "$RECIPE_TARGET"
+			echo ""
+			echo "Recipe generated at: $RECIPE_TARGET"
+			echo "Review it and run 'forge assay $PACKAGE' before smithing."
+			exit 0
+		fi
+
+		SKETCH_IS_GIT=0
+		[ "$SKETCH_BOOK" = "git" ] && SKETCH_IS_GIT=1
+
+		PAGE_HTML=""
+		SK_DL_HTML=""
+		SK_DL_BASE_URL=""
+		SK_PATCH_EXTRA_HTML=""
+		SK_DL_MAIN_URL=""
+
+		if [ "$SKETCH_IS_GIT" -eq 1 ]; then
+			echo "Cloning $SKETCH_URL to inspect it${SKETCH_REF:+ (ref: $SKETCH_REF)}..."
+			SK_GIT_RESULT=$(sketch_git_lookup "$SKETCH_URL" "$SKETCH_REF")
+			if [ -z "$SK_GIT_RESULT" ]; then
+				echo "Error: couldn't clone '$SKETCH_URL'${SKETCH_REF:+ at ref '$SKETCH_REF'} -- check the URL/ref."
+				exit 1
+			fi
+			SK_GIT_CLONE_DIR=""
+			IFS=$'\t' read -r SK_VERSION SK_GIT_REF_RESOLVED SK_GIT_CLONE_DIR <<< "$SK_GIT_RESULT"
+			echo "Resolved to ref '$SK_GIT_REF_RESOLVED' (version: $SK_VERSION)"
+
+			SK_DETECTED_BUILD=$(sketch_detect_build_system_dir "$SK_GIT_CLONE_DIR")
+			if [ -n "$SK_DETECTED_BUILD" ]; then
+				echo "Detected a $SK_DETECTED_BUILD build in the repo -- generating generic heat()/mold()/smith() (REVIEW these, they're a generic guess, not scraped from documentation)."
+				sketch_generic_build_commands "$SK_DETECTED_BUILD"
+			else
+				echo "Warning: no recognizable build system (meson.build/configure/autogen.sh/setup.py) found in the repo. heat()/mold()/smith() are left as TODO."
+				SK_HEAT_BODY="# TODO: no recognizable build system found in the repo."
+				SK_MOLD_BODY="# TODO: no build command automatically found in the repo."
+				SK_SMITH_BODY="# TODO: no install command automatically found in the repo."
+			fi
+			rm -rf "$SK_GIT_CLONE_DIR"
+		elif [ "$SKETCH_IS_TARBALL" -eq 1 ]; then
+			echo "'--url' points straight at a tarball -- skipping page scraping. Deriving version from the filename and detecting the build system from the archive itself."
+			PAGE_HTML=""
+			SK_DL_HTML=""
+			SK_DL_BASE_URL="$SKETCH_URL"
+			SK_PATCH_EXTRA_HTML=""
+			SK_METADATA=$(sketch_parse_tarball_url "$SKETCH_URL")
+			if [ -z "$SK_METADATA" ]; then
+				echo "Error: couldn't find a '-<version>' suffix in '$SKETCH_URL' (expected something like pkgname-1.2.3.tar.xz)."
+				exit 1
+			fi
+		else
+			echo "Downloading page: $SKETCH_URL"
+			PAGE_HTML=$(wget -qO- "$SKETCH_URL")
+			if [ -z "$PAGE_HTML" ]; then
+				echo "Error: failed to download $SKETCH_URL"
+				exit 1
+			fi
+
+			# LFS build pages don't carry their own Download/checksum info --
+			# see sketch_find_lfs_download_section. Fetch the two chapter 3
+			# pages once and pull out this package's section from each, to
+			# use as a fallback wherever the build page itself comes up
+			# empty. SK_DL_HTML feeds metadata/additional-downloads
+			# extraction; SK_PATCH_EXTRA_HTML is appended alongside PAGE_HTML
+			# for patch-link extraction (patches can be listed on either
+			# page depending on the package).
+			SK_DL_HTML="$PAGE_HTML"
+			SK_DL_BASE_URL="$SKETCH_URL"
+			SK_PATCH_EXTRA_HTML=""
+			if [ "$SKETCH_BOOK" = "lfs" ]; then
+				if ! printf '%s' "$PAGE_HTML" | grep -qiP 'Download\s*\(HTTP\)'; then
+					echo "LFS build page has no download link -- checking chapter 3 (Packages) for it..."
+					SK_LFS_PACKAGES_HTML=$(wget -qO- "$LFS_PACKAGES_PAGE_URL")
+					if [ -n "$SK_LFS_PACKAGES_HTML" ]; then
+						SK_LFS_DL_SECTION=$(sketch_find_lfs_download_section "$SK_LFS_PACKAGES_HTML" "$PACKAGE")
+						if [ -n "$SK_LFS_DL_SECTION" ]; then
+							SK_DL_HTML="$SK_LFS_DL_SECTION"
+							SK_DL_BASE_URL="$LFS_PACKAGES_PAGE_URL"
+						else
+							echo "Warning: '$PACKAGE' not found on the chapter 3 Packages page either -- download/checksum will be left as TODO."
+						fi
+					else
+						echo "Warning: failed to download $LFS_PACKAGES_PAGE_URL"
+					fi
+				fi
+				SK_LFS_PATCHES_HTML=$(wget -qO- "$LFS_PATCHES_PAGE_URL")
+				if [ -n "$SK_LFS_PATCHES_HTML" ]; then
+					SK_PATCH_EXTRA_HTML=$(sketch_find_lfs_download_section "$SK_LFS_PATCHES_HTML" "$PACKAGE")
+				fi
+			fi
+
+			SK_MULTI_CATEGORY="${SKETCH_CATEGORY:-$PACKAGE}"
+			SK_MULTI_COUNT=0
+			SK_MULTI_SKIPPED=0
+			while IFS= read -r -d '' SK_SECTION_HTML; do
+				SK_MULTI_COUNT=$((SK_MULTI_COUNT + 1))
+				sketch_generate_one "$SK_SECTION_HTML" "$SKETCH_URL" "$SK_MULTI_CATEGORY" "$SKETCH_FORCE" \
+					|| SK_MULTI_SKIPPED=$((SK_MULTI_SKIPPED + 1))
+			done < <(sketch_split_multi_page "$PAGE_HTML")
+
+			if [ "$SK_MULTI_COUNT" -gt 0 ]; then
+				echo ""
+				echo "Multi-package page detected ($SK_MULTI_COUNT packages found on this one page)."
+				echo "Recipes written to: ${RECIPE_DIR}/${SK_MULTI_CATEGORY}/"
+				[ "$SK_MULTI_SKIPPED" -gt 0 ] && echo "$SK_MULTI_SKIPPED already existed and were skipped (use --force to overwrite)."
+				echo "These are drafts like any other 'forge sketch' output -- review before smithing."
+				exit 0
+			fi
+
+			if [ "$SKETCH_BOOK" = "gnome" ]; then
+				SK_METADATA="$SK_GNOME_METADATA"
+			else
+				SK_METADATA=$(sketch_extract_metadata "$SK_DL_HTML")
+			fi
+			if [ -z "$SK_METADATA" ]; then
+				echo "Error: couldn't identify a tarball/version link on that page."
+				if [ "$SKETCH_BOOK" = "lfs" ]; then
+					echo "Checked both the build page and the chapter 3 Packages page. Check manually: $SKETCH_URL and $LFS_PACKAGES_PAGE_URL"
+				else
+					echo "The page might not follow the book's standard format. Check it manually: $SKETCH_URL"
+				fi
+				exit 1
+			fi
+		fi
+		if [ "$SKETCH_IS_GIT" -ne 1 ]; then
+			IFS=$'\t' read -r SK_URL_TEMPLATE SK_VERSION SK_ALGO SK_CHECKSUM <<< "$SK_METADATA"
+			SK_DL_MAIN_URL="${SK_URL_TEMPLATE//\$\{VERSION\}/$SK_VERSION}"
+		fi
+
+		if [ "$SKETCH_IS_GIT" -ne 1 ]; then
+			SK_HEAT_BODY=""
+			SK_MOLD_BODY=""
+			SK_SMITH_BODY=""
+			SK_FINISH_BODY=""
+			while IFS=$'\t' read -r SK_TAG SK_BLOCK; do
+				[ -z "$SK_TAG" ] && continue
+				SK_REAL_BLOCK=$(printf '%b' "$SK_BLOCK")
+				if [[ "$SK_TAG" == *O ]]; then
+					SK_REAL_BLOCK="# OPTIONAL per the book (verify whether you want this) -->"$'\n'"${SK_REAL_BLOCK}"
+					SK_TAG="${SK_TAG%O}"
+				fi
+				case "$SK_TAG" in
+					F) SK_FINISH_BODY+="${SK_REAL_BLOCK}"$'\n' ;;
+					R) SK_SMITH_BODY+="${SK_REAL_BLOCK}"$'\n' ;;
+					*) SK_MOLD_BODY+="${SK_REAL_BLOCK}"$'\n' ;;
+				esac
+			done < <(sketch_extract_blocks "$PAGE_HTML")
+
+			if [ -z "$SK_SMITH_BODY" ] && [ -n "$SK_MOLD_BODY" ]; then
+				SK_LAST_LINE=$(printf '%s\n' "$SK_MOLD_BODY" | grep -E '(make|ninja|meson).*install' | tail -n1)
+				if [ -n "$SK_LAST_LINE" ]; then
+					SK_MOLD_BODY=$(printf '%s\n' "$SK_MOLD_BODY" | grep -vF "$SK_LAST_LINE")
+					SK_SMITH_BODY="${SK_LAST_LINE}"$'\n'
+				fi
+			fi
+
+			if [ -n "$SK_MOLD_BODY" ]; then
+				sketch_split_heat_mold "$SK_MOLD_BODY"
+			fi
+
+			if [ -z "$SK_HEAT_BODY" ] && [ -z "$SK_MOLD_BODY" ] && [ -z "$SK_SMITH_BODY" ]; then
+				echo "No command blocks found${SKETCH_BOOK:+ on the $SKETCH_BOOK page} -- checking the tarball itself for a recognizable build system..."
+				SK_PEEK_TARBALL="${WORKDIR}/.sketch-peek-$$"
+				mkdir -p "$WORKDIR"
+				if wget -qO "$SK_PEEK_TARBALL" "$SK_DL_MAIN_URL"; then
+					SK_DETECTED_BUILD=$(sketch_detect_build_system "$SK_PEEK_TARBALL")
+				else
+					SK_DETECTED_BUILD=""
+					echo "Warning: couldn't download the tarball to inspect it ($SK_DL_MAIN_URL)."
+				fi
+				rm -f "$SK_PEEK_TARBALL"
+
+				if [ -n "$SK_DETECTED_BUILD" ]; then
+					case "$SK_DETECTED_BUILD" in
+						meson)     SK_DETECTED_FILE="meson.build" ;;
+						configure) SK_DETECTED_FILE="configure" ;;
+						autogen)   SK_DETECTED_FILE="autogen.sh" ;;
+						setuppy)   SK_DETECTED_FILE="setup.py" ;;
+					esac
+					echo "Found a top-level '$SK_DETECTED_FILE' in the tarball -- generating generic heat()/mold()/smith() (REVIEW these, they're a generic guess, not scraped from documentation)."
+					sketch_generic_build_commands "$SK_DETECTED_BUILD"
+				else
+					echo "Warning: no recognizable build system (meson.build/configure/autogen.sh/setup.py) found in the tarball either. heat()/mold()/smith() are left as TODO."
+					SK_HEAT_BODY="# TODO: no configuration command was automatically found on the book page or detected in the tarball."
+					SK_MOLD_BODY="# TODO: no build command was automatically found on the book page or detected in the tarball."
+					SK_SMITH_BODY="# TODO: no install command was automatically found on the book page or detected in the tarball."
+				fi
+			fi
+		fi
+
+		# A page/tarball can genuinely have build+install commands but no
+		# separate configuration step at all (setup.py-based Python
+		# packages, header-only projects, anything that skipped straight
+		# to make/ninja in its own docs) -- per the "always define heat()"
+		# convention, note that explicitly instead of leaving it out.
+		if [ -z "$SK_HEAT_BODY" ]; then
+			SK_HEAT_BODY="echo 'No configuration for this package'"$'\n'
+		fi
+
+		# Fix up heredocs (<<EOF -> <<-EOF) so the closing delimiter
+		# survives being tab-indented below -- plain "<<" requires the
+		# delimiter at column 0, "<<-" strips leading tabs from it.
+		SK_HEREDOC_FIX='s/<<[[:space:]]*("|'"'"')?([A-Za-z_][A-Za-z0-9_]*)\1/<<-\1\2\1/'
+		SK_HEAT_BODY=$(printf '%s\n' "$SK_HEAT_BODY" | sed -E "$SK_HEREDOC_FIX")
+		SK_MOLD_BODY=$(printf '%s\n' "$SK_MOLD_BODY" | sed -E "$SK_HEREDOC_FIX")
+		SK_SMITH_BODY=$(printf '%s\n' "$SK_SMITH_BODY" | sed -E "$SK_HEREDOC_FIX")
+		SK_FINISH_BODY=$(printf '%s\n' "$SK_FINISH_BODY" | sed -E "$SK_HEREDOC_FIX")
+
+		SK_BUILD_DIR=$(sketch_detect_build_dir "$SK_MOLD_BODY")
+		if [ -n "$SK_BUILD_DIR" ]; then
+			SK_SMITH_BODY="cd \"${SK_BUILD_DIR}\"  # mold() builds here; smith() starts fresh in \$SRC_DIR"$'\n'"${SK_SMITH_BODY}"
+		fi
+
+		SK_SMITH_BODY=$(printf '%s\n' "$SK_SMITH_BODY" \
+			| sed -e '/DESTDIR/!s/\(make[^&|;]*\)install\b/\1DESTDIR="$1" install/' \
+			      -e '/DESTDIR/!s/\(ninja[^&|;]*\)install\b/DESTDIR="$1" \1install/')
+		SK_SMITH_BODY=$(printf '%s\n' "$SK_SMITH_BODY" | while IFS= read -r SK_LINE; do
+			if printf '%s' "$SK_LINE" | grep -qE '(/usr/|/etc/|/var/|/opt/)' \
+				&& ! printf '%s' "$SK_LINE" | grep -qE 'DESTDIR|\$1'; then
+				printf '%s  # TODO: references an absolute path -- check whether it needs to be prefixed with "$1"\n' "$SK_LINE"
+			else
+				printf '%s\n' "$SK_LINE"
+			fi
+		done)
+
+		SK_DEPS_HINT=""
+		SK_DEPS_SECTION=$(printf '%s' "$PAGE_HTML" | grep -ozP '(?is)Required[^<]*</[^>]+>.*?</ul>' | tr -d '\0' | head -c 3000)
+		if [ -n "$SK_DEPS_SECTION" ]; then
+			SK_DEPS_HINT=$(printf '%s' "$SK_DEPS_SECTION" | grep -oP '(?<=>)[A-Za-z0-9][A-Za-z0-9+._-]*(?=</a>)' | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+		fi
+
+		SK_PATCHES=()
+		while IFS= read -r SK_PATCH_URL; do
+			[ -z "$SK_PATCH_URL" ] && continue
+			SK_PATCHES+=("$SK_PATCH_URL")
+		done < <(
+			{
+				sketch_extract_patches "$PAGE_HTML" "$SKETCH_URL"
+				[ -n "$SK_PATCH_EXTRA_HTML" ] && sketch_extract_patches "$SK_PATCH_EXTRA_HTML" "$LFS_PATCHES_PAGE_URL"
+			} | sort -u
+		)
+
+		SK_ADDITIONAL_LINES=""
+		while IFS=$'\t' read -r SK_DL_URL SK_DL_OPTIONAL; do
+			[ -z "$SK_DL_URL" ] && continue
+			if [ "$SK_DL_OPTIONAL" = "1" ]; then
+				SK_ADDITIONAL_LINES+="# OPTIONAL per the book:"$'\n'"# wget \"${SK_DL_URL}\""$'\n'
+			else
+				SK_ADDITIONAL_LINES+="wget \"${SK_DL_URL}\"  # TODO: additional download found on the book page -- verify it's needed and add a checksum check if so"$'\n'
+			fi
+		done < <(sketch_extract_additional_downloads "$SK_DL_HTML" "$SK_DL_BASE_URL" "$SK_DL_MAIN_URL")
+		if [ -n "$SK_ADDITIONAL_LINES" ]; then
+			SK_MOLD_BODY="${SK_ADDITIONAL_LINES}${SK_MOLD_BODY}"
+		fi
+
+		mkdir -p "$(dirname "$RECIPE_TARGET")"
+		{
+			echo "# Auto-generated by 'forge sketch' from:"
+			echo "#   $SKETCH_URL"
+			echo "# REVIEW before using: check configure/meson/cmake flags, the DEPS array,"
+			echo "# and whether smith() really installs into \"\$1\" (staging), not the real system."
+			[ -n "$SK_DEPS_HINT" ] && echo "# Dependencies mentioned in the book (add to the DEPS array manually): $SK_DEPS_HINT"
+			if [ ${#SK_PATCHES[@]} -gt 0 ]; then
+				echo "# Patch link(s) found on the page -- REVIEW: these rarely list a checksum"
+				echo "# next to them the way the main tarball does, so none is set below. Add"
+				echo "# one manually (url::sha256sum) once you've verified the patch, and apply"
+				echo "# it in mold() the way the book shows (patches land in \"\$WORKDIR\", a"
+				echo "# sibling of the extracted source tree, so 'patch -Np1 -i ../foo.patch'"
+				echo "# from inside mold() works as-is)."
+			fi
+			echo ""
+			echo "NAME=\"${PACKAGE}\""
+			echo "VERSION=\"${SK_VERSION}\""
+			if [ "$SKETCH_IS_GIT" -eq 1 ]; then
+				echo "GIT_URL=\"${SKETCH_URL}\""
+				echo "GIT_REF=\"${SK_GIT_REF_RESOLVED}\"  # pin this -- an unpinned branch means every future 'smith' could pull something different"
+			else
+				echo "URL=\"${SK_URL_TEMPLATE}\""
+				if [ "$SK_ALGO" = "sha256" ] && [ -n "$SK_CHECKSUM" ]; then
+					echo "SHA256SUM=\"${SK_CHECKSUM}\""
+				elif [ "$SK_ALGO" = "md5" ] && [ -n "$SK_CHECKSUM" ]; then
+					echo "MD5SUM=\"${SK_CHECKSUM}\""
+				else
+					echo "# TODO: no checksum was automatically found on the page; add SHA256SUM or MD5SUM."
+				fi
+			fi
+			if [ ${#SK_PATCHES[@]} -gt 0 ]; then
+				echo "EXTRA_FILES=("
+				for SK_PATCH_URL in "${SK_PATCHES[@]}"; do
+					echo "	\"${SK_PATCH_URL}\"  # TODO: add ::sha256sum after verifying"
+				done
+				echo ")"
+			fi
+			echo ""
+			echo "heat() {"
+			printf '%s\n' "$SK_HEAT_BODY" | sed '/^[[:space:]]*$/d; s/^/\t/'
+			echo "}"
+			echo ""
+			echo "mold() {"
+			printf '%s\n' "$SK_MOLD_BODY" | sed '/^[[:space:]]*$/d; s/^/\t/'
+			echo "}"
+			echo ""
+			echo "smith() {"
+			printf '%s\n' "$SK_SMITH_BODY" | sed '/^[[:space:]]*$/d; s/^/\t/'
+			echo "}"
+			if [ -n "$SK_FINISH_BODY" ]; then
+				echo ""
+				echo "# From a 'Configuring $PACKAGE' section on the book page -- these run"
+				echo "# against the REAL installed system (not staging), same as smith()'s"
+				echo "# \"\$1\", which is why there's no DESTDIR/\"\$1\" rewriting here."
+				echo "finish() {"
+				printf '%s\n' "$SK_FINISH_BODY" | sed '/^[[:space:]]*$/d; s/^/\t/'
+				echo "}"
+			fi
+		} > "$RECIPE_TARGET"
+
+		echo ""
+		echo "Recipe generated at: $RECIPE_TARGET"
+		if [ -n "$SK_FINISH_BODY" ]; then
+			echo "Found a 'Configuring' section on the page -- added as finish()."
+		fi
+		if [ -n "$SK_BUILD_DIR" ]; then
+			echo "Detected a build subdirectory ('$SK_BUILD_DIR') -- added a cd at the start of smith()."
+		fi
+		if [ -n "$SK_ADDITIONAL_LINES" ]; then
+			echo "Found additional download(s) beyond the main tarball -- added to mold() (commented out if the page marked them optional)."
+		fi
+		echo "Review mold()/smith() and run 'forge assay $PACKAGE' before smithing."
+		;;
+	temper)
+		if [ -z "$PACKAGE" ]; then
+			echo "Error: Specify the package to update, e.g. 'forge temper foo'"
+			exit 1
+		fi
+
+		if [ "$PACKAGE" = "--all" ]; then
+			echo "Checking all installed packages for updates..."
+			TO_UPDATE=()
+			UP_TO_DATE=()
+			SKIPPED=()
+
+			for MANIFEST_FILE in "$LOG_DIR"/*.files; do
+				[ -e "$MANIFEST_FILE" ] || continue
+				PKG_NAME=$(basename "$MANIFEST_FILE" .files)
+				PKG_RECIPE=$(resolve_recipe "$PKG_NAME")
+
+				if [ $? -ne 0 ] || [ ! -f "$PKG_RECIPE" ]; then
+					SKIPPED+=("$PKG_NAME (no recipe found)")
+					continue
+				fi
+
+				RECIPE_VERSION=$(source "$PKG_RECIPE" >/dev/null 2>&1; echo "${VERSION%$'\r'}")
+				INSTALLED_VERSION=$(head -n1 "$MANIFEST_FILE" | sed -n 's/^#VERSION=//p')
+
+				if [ "$INSTALLED_VERSION" = "$RECIPE_VERSION" ]; then
+					UP_TO_DATE+=("$PKG_NAME")
+				else
+					TO_UPDATE+=("$PKG_NAME (${INSTALLED_VERSION:-unknown} -> $RECIPE_VERSION)")
+				fi
+			done
+
+			if [ ${#TO_UPDATE[@]} -eq 0 ]; then
+				echo "All packages are already up to date."
+				[ ${#SKIPPED[@]} -gt 0 ] && echo "Skipped: ${SKIPPED[*]}"
+				exit 0
+			fi
+			
+			echo ""
+			echo "The following package(s) will be tempered:"
+			for ENTRY in "${TO_UPDATE[@]}"; do
+				echo "	- $ENTRY"
+			done
+			echo ""
+
+			ALL_FORCE=$3
+			if [[ ! "$ALL_FORCE" =~ ^(-y|--yes)$ ]]; then
+				read -rp "Proceed with tempering ${#TO_UPDATE[@]} packages(s)? [y/N] " CONFIRM
+				case "$CONFIRM" in
+					[yY][eE][sS]|[yY]) ;;
+					*) echo "Temper --all aborted."; exit 0 ;;
+				esac
+			fi
+
+			UPDATED=()
+			for ENTRY in "${TO_UPDATE[@]}"; do
+				PKG_NAME="${ENTRY%% *}"
+				echo ""
+				echo "=== Tempering $ENTRY ==="
+				"$0" smith "$PKG_NAME" -y
+				if [ $? -eq 0 ]; then
+					UPDATED+=("$PKG_NAME")
+				else
+					SKIPPED+=("$PKG_NAME (smith failed, see output above)")
+				fi
+			done
+
+			echo ""
+			echo "=== Temper --all summary ==="
+			echo "Updated: ${UPDATED[*]:-none}"
+			echo "Already up to date: ${UP_TO_DATE[*]:-none}"
+			[ ${#SKIPPED[@]} -gt 0 ] && echo "Skipped: ${SKIPPED[*]}"
+			exit 0
+		fi
+		
+		RECIPE=$(resolve_recipe "$PACKAGE")
+		RESOLVE_STATUS=$?
+
+		if [ "$RESOLVE_STATUS" -eq 2 ]; then
+			exit 1
+		elif [ "$RESOLVE_STATUS" -ne 0 ] || [ ! -f "$RECIPE" ]; then
+			echo "Error: Recipe for '$PACKAGE' not found on $RECIPE_DIR"
+			exit 1
+		fi
+
+		source "$RECIPE"
+		NAME="${NAME%$'\r'}"
+		VERSION="${VERSION%$'\r'}"
+		CHECKSUM_URL="${CHECKSUM_URL%$'\r'}"
+		CHECKSUM_ALGO_HINT="${CHECKSUM_ALGO_HINT%$'\r'}"
+
+		MANIFEST="${LOG_DIR}/${NAME}.files"
+
+		if [ ! -f "$MANIFEST" ]; then
+			echo "Package '$NAME' is not installed. Use 'forge smith $NAME' to install it."
+			exit 1
+		fi
+
+		INSTALLED_VERSION=$(head -n1 "$MANIFEST" | sed -n 's/^#VERSION=//p')
+
+		if [ "$INSTALLED_VERSION" = "$VERSION" ]; then
+			echo "Package '$NAME' is already up to date (version $VERSION)."
+			exit 0
+		fi
+
+		echo "Tempering '$NAME' from ${INSTALLED_VERSION:-unknown} to $VERSION..."
+
+		TEMPER_FORCE=$3
+		if [[ ! "$TEMPER_FORCE" =~ ^(-y|--yes)$ ]]; then
+			read -rp "Proceed? [y/N] " CONFIRM
+			case "$CONFIRM" in
+				[yY][eE][sS]|[yY]) ;;
+				*) echo "Temper aborted."; exit 0 ;;
+			esac
+		fi
+
+		if [ -n "$CHECKSUM_URL" ]; then
+			echo "Refreshing checksum for '$NAME' $VERSION..."
+			fetch_and_save_checksum "$NAME" "$VERSION" "$CHECKSUM_URL" "$CHECKSUM_ALGO_HINT"
+		fi
+
+		TEMPER_CLEAN=""
+		for ARG in "$@"; do
+			{ [ "$ARG" = "--clean" ] || [ "$ARG" = "--fresh" ]; } && TEMPER_CLEAN="$ARG"
+		done
+
+		exec "$0" smith "$PACKAGE" -y $TEMPER_CLEAN
+		;;
+	melt)
+		if [ -z "$PACKAGE" ]; then
+			echo "Error: Specify the package to melt, e.g. 'forge melt foo'"
+			exit 1
+		fi
+
+		MELT_WITH_DEPS=0
+		MELT_FORCE=0
+		for ARG in "$@"; do
+			[ "$ARG" = "--with-deps" ] && MELT_WITH_DEPS=1
+			{ [ "$ARG" = "-y" ] || [ "$ARG" = "--yes" ] || [ "$ARG" = "-f" ] || [ "$ARG" = "--force" ]; } && MELT_FORCE=1
+		done
+		FORCE=""
+		[ "$MELT_FORCE" -eq 1 ] && FORCE="-y"
+
+		LOCK_FILE="${FORGE_HOME:+$FORGE_HOME/forge.lock}"
+		LOCK_FILE="${LOCK_FILE:-/var/lock/forge.lock}"
+		mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
+		exec 200>"$LOCK_FILE"
+		if ! flock -n 200; then
+			echo "Error: existing lock file /var/lock/forge.lock, likely to be by an already existing forge operation, if there's not, remove the lock file and try again."
+			exit 1
+		fi
+				
+		MANIFEST="${LOG_DIR}/${PACKAGE}.files"
+
+		if [ ! -f "$MANIFEST" ]; then
+			echo "Error: Package '$PACKAGE' does not seem to be installed by forge (manifest not found)."
+			exit 1
+		fi
+
+		INSTALLED_VERSION=$(head -n1 "$MANIFEST" | sed -n 's/^#VERSION=//p')
+
+		DEPENDENTS=()
+		for OTHER_MANIFEST in "$LOG_DIR"/*.files; do
+			[ -e "$OTHER_MANIFEST" ] || continue
+			OTHER_NAME=$(basename "$OTHER_MANIFEST" .files)
+			[ "$OTHER_NAME" = "$PACKAGE" ] && continue
+
+			OTHER_RECIPE=$(resolve_recipe "$OTHER_NAME")
+			[ -n "$OTHER_RECIPE" ] && [ -f "$OTHER_RECIPE" ] || continue
+
+			OTHER_DEPS=$(
+				DEPS=()
+				source "$OTHER_RECIPE" >/dev/null 2>&1
+				printf '%s\n' "${DEPS[@]}"
+			)
+			if printf '%s\n' "$OTHER_DEPS" | grep -qx "$PACKAGE"; then
+				DEPENDENTS+=("$OTHER_NAME")
+			fi
+		done
+
+		if [ ${#DEPENDENTS[@]} -gt 0 ]; then
+			echo "Warning: the following installed package(s) depend on '$PACKAGE': ${DEPENDENTS[*]}"
+			echo "Removing it may break them."
+		fi	
+		
+		echo "About to melt package: $PACKAGE ${INSTALLED_VERSION:+(version $INSTALLED_VERSION)}"
+
+		if [[ ! "$FORCE" =~ ^(-y|--yes)$ ]]; then
+			read -rp "Are you sure you want to remove '$PACKAGE'? [y/N] " CONFIRM
+			case "$CONFIRM" in
+				[yY][eE][sS]|[yY]) ;;
+				*) echo "Melting aborted."; exit 0 ;;
+			esac
+		fi
+				
+		echo "Melting the package: $PACKAGE..."
+		
+		while read -r file; do
+			[[ "$file" == \#* ]] && continue
+		
+			REAL_FILE="${INSTALL_ROOT%/}${file#.}"
+
+			if [ -f "$REAL_FILE" ] || [ -h "$REAL_FILE" ]; then
+				rm -v "$REAL_FILE"
+			elif [ -d "$REAL_FILE" ]; then
+				rmdir "$REAL_FILE" 2>/dev/null && echo "Removed directory '$REAL_FILE'"
+			fi
+		done < "$MANIFEST"
+
+		rm "$MANIFEST"
+		forge_log_history "REMOVE" "$PACKAGE" "$INSTALLED_VERSION"
+
+		echo "Package '$PACKAGE' completely melted from system!"
+
+		if [ "$MELT_WITH_DEPS" -eq 1 ]; then
+			ORPHANS_AFTER=$(forge_find_orphans)
+			if [ -n "$ORPHANS_AFTER" ]; then
+				echo ""
+				echo "Now-orphaned dependencies (nothing installed needs them anymore):"
+				printf '%s\n' "$ORPHANS_AFTER" | sed 's/^/  /'
+				if [[ ! "$FORCE" =~ ^(-y|--yes)$ ]]; then
+					read -rp "Remove these too? [y/N] " CONFIRM_ORPHANS
+				else
+					CONFIRM_ORPHANS="y"
+				fi
+				case "$CONFIRM_ORPHANS" in
+					[yY][eE][sS]|[yY])
+						while IFS= read -r ORPHAN_PKG; do
+							[ -z "$ORPHAN_PKG" ] && continue
+							"$0" melt "$ORPHAN_PKG" -y
+						done <<< "$ORPHANS_AFTER"
+						;;
+					*) echo "Leaving orphaned dependencies in place." ;;
+				esac
+			fi
+		fi
+		;;
+	orphans)
+		echo "Checking for orphaned dependencies..."
+		ORPHAN_LIST=$(forge_find_orphans)
+		if [ -z "$ORPHAN_LIST" ]; then
+			echo "No orphaned dependencies found."
+		else
+			echo "Installed only as a dependency, and nothing installed needs them anymore:"
+			printf '%s\n' "$ORPHAN_LIST" | sed 's/^/  /'
+			echo ""
+			echo "Remove one:   forge melt <pkg>"
+			echo "(Removing whatever originally pulled these in with 'forge melt --with-deps <pkg>' offers to clean these up automatically.)"
+		fi
+		;;
+	search)
+		if [ -z "$PACKAGE" ]; then
+			echo "Error: Specify a search term, e.g. 'forge search image'"
+			exit 1
+		fi
+		SEARCH_TERM="$PACKAGE"
+		SEARCH_HITS=0
+		while IFS= read -r RECIPE_FILE; do
+			[ -f "$RECIPE_FILE" ] || continue
+			SEARCH_NAME=""
+			SEARCH_DESC=""
+			SEARCH_NAME=$(sed -n 's/^NAME="\?\([^"]*\)"\?.*/\1/p' "$RECIPE_FILE" | head -n1)
+			SEARCH_DESC=$(sed -n 's/^DESCRIPTION="\?\([^"]*\)"\?.*/\1/p' "$RECIPE_FILE" | head -n1)
+			[ -z "$SEARCH_NAME" ] && SEARCH_NAME=$(basename "$RECIPE_FILE" .sh)
+			if printf '%s\n%s\n' "$SEARCH_NAME" "$SEARCH_DESC" | grep -qi -- "$SEARCH_TERM"; then
+				SEARCH_HITS=$((SEARCH_HITS + 1))
+				SEARCH_STATUS="not installed"
+				[ -f "${LOG_DIR}/${SEARCH_NAME}.files" ] && SEARCH_STATUS="installed"
+				echo "${SEARCH_NAME} (${SEARCH_STATUS})${SEARCH_DESC:+ -- $SEARCH_DESC}"
+			fi
+		done < <(find "$RECIPE_DIR" -name '*.sh' 2>/dev/null | sort)
+		if [ "$SEARCH_HITS" -eq 0 ]; then
+			echo "No recipes matching '$SEARCH_TERM' in $RECIPE_DIR."
+			echo "Try 'forge sketch $SEARCH_TERM' to look it up in a book/GNOME/git instead."
+		fi
+		;;
+	patts)
+		echo "Available patterns (recipes) in $RECIPE_DIR:"
+		while IFS= read -r RECIPE_FILE; do
+			[ -e "$RECIPE_FILE" ] || continue
+			PKG_NAME=$(basename "$RECIPE_FILE" .sh)
+			PKG_VERSION=$(source "$RECIPE_FILE" >/dev/null 2>&1; echo "${VERSION%$'\r'}")
+
+			if [ -f "${LOG_DIR}/${PKG_NAME}.files" ]; then
+				STATUS="installed"
+			else
+				STATUS="not installed"
+			fi
+
+			REL_DIR=$(dirname "${RECIPE_FILE#$RECIPE_DIR/}")
+			if [ "$REL_DIR" != "." ]; then
+				CATEGORY=" [$REL_DIR]"
+			else
+				CATEGORY=""
+			fi
+
+			if [ -n "$PKG_VERSION" ]; then
+				echo "$PKG_NAME ($PKG_VERSION) - $STATUS$CATEGORY"
+			else
+				echo "$PKG_NAME - $STATUS$CATEGORY"
+			fi
+		done < <(find "$RECIPE_DIR" -type f -name "*.sh" | sort)
+		;;
+	wares)
+		echo "Packages installed on system:"
+		mkdir -p "$LOG_DIR"
+		for MANIFEST_FILE in "$LOG_DIR"/*.files; do
+			[ -e "$MANIFEST_FILE" ] || continue
+			PKG_NAME=$(basename "$MANIFEST_FILE" .files)
+			PKG_VERSION=$(head -n1 "$MANIFEST_FILE" | sed -n 's/^#VERSION=//p')
+			if [ -n "$PKG_VERSION" ]; then
+				echo "	$PKG_NAME ($PKG_VERSION)"
+			else
+				echo "	$PKG_NAME"
+			fi
+		done
+		;;
+	gauge)
+		if [ -z "$PACKAGE" ]; then
+			echo "Error: Specify the package to gauge, e.g. 'forge gauge foo'"
+			exit 1
+		fi
+
+		RECIPE=$(resolve_recipe "$PACKAGE")
+		RESOLVE_STATUS=$?
+
+		if [ "$RESOLVE_STATUS" -eq 2 ]; then
+			exit 1
+		elif [ "$RESOLVE_STATUS" -ne 0 ] || [ ! -f "$RECIPE" ]; then
+			echo "Error: Recipe for '$PACKAGE' not found"
+			exit 1
+		fi
+
+		OPTIONS=()
+		source "$RECIPE"
+
+		NAME="${NAME%$'\r'}"
+		VERSION="${VERSION%$'\r'}"
+		URL="${URL%$'\r'}"
+		SHA256SUM="${SHA256SUM%$'\r'}"
+		MD5SUM="${MD5SUM%$'\r'}"
+
+		CHECKSUM_SOURCE=""
+		if [ -f "${CHECKSUM_DIR}/${NAME}.sha256sum" ] || [ -f "${CHECKSUM_DIR}/${NAME}.md5sum" ]; then
+			CHECKSUM_SOURCE=" (from $CHECKSUM_DIR)"
+		fi
+		load_external_checksum "$NAME"
+
+		echo "Details of Package: $NAME"
+		echo "==============================="
+		echo "Version: $VERSION"
+		echo "URL: $URL"
+		if [ -n "$SHA256SUM" ]; then
+			echo "SHA256: ${SHA256SUM}${CHECKSUM_SOURCE}"
+		elif [ -n "$MD5SUM" ]; then
+			echo "MD5: ${MD5SUM}${CHECKSUM_SOURCE}"
+		else
+			echo "Checksum: Not defined (checksum verification will be skipped)"
+		fi
+		echo "Description: ${DESCRIPTION:-No description provided.}"
+		if declare -p OPTIONS >/dev/null 2>&1 && [ ${#OPTIONS[@]} -gt 0 ]; then
+			echo "Options:"
+			for GOPT_ENTRY in "${OPTIONS[@]}"; do
+				GOPT_ENTRY="${GOPT_ENTRY%$'\r'}"
+				GOPT_KEY="${GOPT_ENTRY%%:*}"
+				GOPT_REST="${GOPT_ENTRY#*:}"
+				GOPT_DESC="${GOPT_REST%%:*}"
+				GOPT_DEFAULT="${GOPT_REST##*:}"
+				[ "$GOPT_DEFAULT" = "y" ] || GOPT_DEFAULT="n"
+				echo "  --with-${GOPT_KEY} / --without-${GOPT_KEY} (default: ${GOPT_DEFAULT}) -- ${GOPT_DESC}"
+			done
+		fi
+		if [ -d "${REPO_DIR}/${NAME}/${VERSION}" ]; then
+			GOPT_CACHED=$(find "${REPO_DIR}/${NAME}/${VERSION}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+			echo "Repo cache: ${GOPT_CACHED} pre-built config(s) for ${VERSION} (forge repo list ${NAME})"
+		fi
+		echo "==============================="
+		;;
+	repo)
+		REPO_SUB="$PACKAGE"
+		REPO_ARG="$3"
+		case "$REPO_SUB" in
+			init)
+				repo_ensure
+				echo "Repo pronto em $REPO_DIR${REPO_REMOTE:+ (remote: $REPO_REMOTE)}"
+				;;
+			pull)
+				repo_ensure
+				if ! git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+					echo "Error: nenhum remote configurado (defina REPO_REMOTE em forge.conf)."
+					exit 1
+				fi
+				git -C "$REPO_DIR" pull --ff-only origin HEAD
+				;;
+			push)
+				repo_ensure
+				if ! git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+					echo "Error: nenhum remote configurado (defina REPO_REMOTE em forge.conf)."
+					exit 1
+				fi
+				git -C "$REPO_DIR" push origin HEAD
+				;;
+			status)
+				repo_ensure
+				echo "Repo path: $REPO_DIR"
+				if git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+					echo "Remote: $(git -C "$REPO_DIR" remote get-url origin)"
+				else
+					echo "Remote: (nenhum configurado)"
+				fi
+				if [ "$REPO_AUTO_PUSH" -eq 1 ]; then
+					echo "Auto-push: habilitado"
+				else
+					echo "Auto-push: desabilitado"
+				fi
+				git -C "$REPO_DIR" status -s
+				;;
+			list)
+				repo_ensure
+				if [ -n "$REPO_ARG" ]; then
+					find "$REPO_DIR/$REPO_ARG" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | while read -r RLD; do
+						RL_VER=$(basename "$(dirname "$RLD")")
+						RL_CFG=$(basename "$RLD")
+						RL_OPTS=""
+						[ -f "$RLD/info" ] && RL_OPTS=$(sed -n 's/^OPTIONS=//p' "$RLD/info")
+						echo "${REPO_ARG} ${RL_VER} (${RL_CFG})${RL_OPTS:+ [$RL_OPTS]}"
+					done
+				else
+					find "$REPO_DIR" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort | while read -r RLD; do
+						RL_CFG=$(basename "$RLD")
+						RL_VER=$(basename "$(dirname "$RLD")")
+						RL_NAME=$(basename "$(dirname "$(dirname "$RLD")")")
+						RL_OPTS=""
+						[ -f "$RLD/info" ] && RL_OPTS=$(sed -n 's/^OPTIONS=//p' "$RLD/info")
+						echo "${RL_NAME} ${RL_VER} (${RL_CFG})${RL_OPTS:+ [$RL_OPTS]}"
+					done
+				fi
+				;;
+			*)
+				echo "Usage: forge repo <init|pull|push|status|list> [pkg]"
+				exit 1
+				;;
+		esac
+		;;
+	menu)
+		if ! command -v whiptail > /dev/null 2>&1; then
+			if command -v dialog > /dev/null 2>&1; then
+				# Termux (and some other environments) only package
+				# dialog, not whiptail -- shim it in, since the two
+				# share most basic option syntax. --scrolltext is
+				# whiptail-only, so it's the one thing filtered out.
+				whiptail() {
+					local args=() a
+					for a in "$@"; do
+						[ "$a" = "--scrolltext" ] && continue
+						args+=("$a")
+					done
+					dialog "${args[@]}"
+				}
+			else
+				echo "Error: neither 'whiptail' nor 'dialog' found. Install one (the 'newt'/'whiptail' package in BLFS, or 'dialog' on Termux) to use 'forge menu'."
+				exit 1
+			fi
+		fi
+
+		while true; do
+			MENU_CHOICE=$(whiptail --title "Forge" --backtitle "LFS Package Manager" \
+				--menu "What would you like to do?" 16 60 4 \
+				"1" "Browse recipes" \
+				"2" "Installed packages" \
+				"3" "Check for updates" \
+				"4" "Exit" \
+				3>&1 1>&2 2>&3)
+			[ $? -ne 0 ] && break
+
+			case "$MENU_CHOICE" in
+				1) menu_browse_recipes ;;
+				2) menu_browse_installed ;;
+				3) menu_check_updates ;;
+				4) break ;;
+			esac
+		done
+		clear
+		;;
+	*)
+		echo "Usage: forge [smith|assay|probe|sketch|temper|melt|gauge|repo|orphans|search] [package name]"
+		echo "       forge [patts|wares|menu]"
+		echo "Run 'forge help' for details on each command and flag."
+		exit 1
+		;;
+esac
