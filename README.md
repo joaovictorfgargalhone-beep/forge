@@ -9,6 +9,8 @@ Forge - The Universal Linux Package Manager - lets you install any package from 
 
 This idea originated from Linux From Scratch (LFS), when I succesfully followed the whole book and booted into the OS. 
 
+![Linux From Scratch Logo](https://www.linuxfromscratch.org/images/linux-from-scratch.png)
+
 After installing internet drivers then WPA Supplicant and DHCP, I realized that writing every command after another finished — to build and install the package — took way too much, so the idea of creating an automatic package installer popped in my mind.
 
 > [!NOTE]
@@ -24,7 +26,7 @@ Then I added other LFS' books support to sketch, SLFS and LFS (much later I adde
 
 > [!TIP]
 > I use Arch btw
-
+> ![Arch Linux Logo](https://upload.wikimedia.org/wikipedia/commons/thumb/f/f9/Archlinux-logo-standard-version.svg/1280px-Archlinux-logo-standard-version.svg.png?utm_source=commons.wikimedia.org&utm_campaign=index&utm_content=thumbnail&_=20240926043220)
 
 
 
