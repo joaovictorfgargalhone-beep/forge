@@ -88,62 +88,47 @@ URL still points at the actual package file (a repo mirror, a local path, wherev
 
 The package's own version (pacman's pkgver from .PKGINFO, or Debian's Version: from control) is used in place of the recipe's own VERSION whenever the two disagree, since that's the authoritative source. Maintainer scripts (pacman's .INSTALL post_install/post_upgrade, Debian's postinst) are deliberately NOT run -- most of what they'd typically do (ldconfig, mandb, desktop/icon/mime caches) is already covered generically by the Hooks system below; 'smith' prints a note when a package had one, so you can check by hand if something package-specific seems to be missing. Everything else (caching, hooks, history, OPTIONS) works the same as any other recipe.
 
-     A recipe may optionally define heat(), run before mold() to handle
-     configuration (./configure, meson setup, cmake, autogen.sh) as its
-     own tracked step -- see the resume paragraph above for why this is
-     separate from mold() rather than lumped into it. Recipes generated
-     by 'sketch' always define one, using
-     echo 'No configuration for this package' as a no-op placeholder
-     when the detected build system has no separate configure step
-     (setup.py-based packages, mainly). heat() is optional for the sake
-     of recipes written before this existed -- if a recipe has none,
-     that step is just skipped.
+A recipe may optionally define heat(), run before mold() to handle
+configuration (./configure, meson setup, cmake, autogen.sh) as its
+own tracked step -- see the resume paragraph above for why this is
+separate from mold() rather than lumped into it. Recipes generated
+by 'sketch' always define one, using
+echo 'No configuration for this package' as a no-op placeholder
+when the detected build system has no separate configure step
+(setup.py-based packages, mainly). heat() is optional for the sake
+of recipes written before this existed -- if a recipe has none,
+that step is just skipped.
 
-     A recipe may optionally define OPTIONS, an array of
-     "key:description:default" entries (default being 'y' or 'n'), for
-     build-time choices mold()/smith() can branch on -- e.g.:
-       OPTIONS=("doxygen:Build API documentation with Doxygen:n")
-     mold()/smith() read the choice from $OPT_DOXYGEN (key upper-cased,
-     - to _; always "y" or "n"). Each option is resolved, in order: from
-     --with-<key>/--without-<key> on the command line; else the
-     recipe's own default when running with -y/--yes; else an
-     interactive prompt in the book's own "[y/N]"/"[Y/n]" style.
+A recipe may optionally define OPTIONS, an array of
+"key:description:default" entries (default being 'y' or 'n'), for
+build-time choices mold()/smith() can branch on -- e.g.:
+ OPTIONS=("doxygen:Build API documentation with Doxygen:n")
+mold()/smith() read the choice from $OPT_DOXYGEN (key upper-cased,
+- to _; always "y" or "n"). Each option is resolved, in order: from
+--with-<key>/--without-<key> on the command line; else the
+recipe's own default when running with -y/--yes; else an
+interactive prompt in the book's own "[y/N]"/"[Y/n]" style.
 
-     Before building, smith checks the repo (REPO_DIR, see 'forge repo'
-     below) for a package already built with the exact same recipe
-     content and OPTIONS. On a match, it skips the download and mold()
-     entirely and installs straight from that cached build. On a miss,
-     it builds normally and -- unless --no-store was given -- caches
-     the result afterward for next time. This applies only to packages
-     with a real URL (tarball); self-contained meta-packages are never
-     cached.
+Before building, smith checks the repo (REPO_DIR, see 'forge repo'
+below) for a package already built with the exact same recipe
+content and OPTIONS. On a match, it skips the download and mold()
+entirely and installs straight from that cached build. On a miss,
+it builds normally and -- unless --no-store was given -- caches
+the result afterward for next time. This applies only to packages
+with a real URL (tarball); self-contained meta-packages are never
+cached.
 
-     Cleanup: as soon as smith() (make/ninja install, staged via DESTDIR
-     into PKG_DIR) finishes a fresh build, the entire extracted
-     source/build tree (SRC_DIR) is deleted right then -- not held onto
-     until the whole run finishes. Nothing past that point needs it:
-     manifest generation, caching, and the final copy to the real
-     filesystem all work from PKG_DIR alone. This matters most for
-     packages like LLVM or Firefox, whose build directory alone can run
-     many times the size of what actually ends up installed -- with the
-     old end-of-run cleanup, that whole tree sat on disk well past the
-     point it was needed. (This never applied to a repo cache hit --
-     there's no source/build tree to begin with when installing straight
-     from a cached build.)
+**Cleanup** 
 
-     Forge also strips debug symbols from ELF binaries/libraries and
-     deletes libtool .la files in PKG_DIR right after, before it's
-     installed onto the real system or cached in the repo. Both are
-     standard LFS/BLFS practice and don't change runtime behavior --
-     Linux binaries don't need .la files the way some other Unixes do,
-     and stripping only removes symbols used for debugging, not
-     anything the program needs to run. This is what actually shrinks
-     what stays installed build over build. Skip with --no-strip /
-     --keep-la, or turn either off permanently via STRIP_BINARIES=0 /
-     REMOVE_LA_FILES=0 in forge.conf. The repo tarball itself is also
-     compressed at xz -9e (max, slower) rather than the default level,
-     since a cached build is written once but meant to be reused --
-     size matters more there than build-time speed.
+As soon as smith() (make/ninja install, staged via DESTDIR into PKG_DIR) finishes a fresh build, the entire extracted source/build tree (SRC_DIR) is deleted right then -- not held onto until the whole run finishes.
+
+Nothing past that point needs it: manifest generation, caching, and the final copy to the real filesystem all work from PKG_DIR alone. This matters most for packages like LLVM or Firefox, whose build directory alone can run many times the size of what actually ends up installed -- with the old end-of-run cleanup, that whole tree sat on disk well past the point it was needed. (This never applied to a repo cache hit -- there's no source/build tree to begin with when installing straight from a cached build.)
+
+Forge also strips debug symbols from ELF binaries/libraries and deletes libtool .la files in PKG_DIR right after, before it's installed onto the real system or cached in the repo. Both are standard LFS/BLFS practice and don't change runtime behavior -- Linux binaries don't need .la files the way some other Unixes do, and stripping only removes symbols used for debugging, not anything the program needs to run. 
+
+This is what actually shrinks what stays installed build over build. Skip with --no-strip / --keep-la, or turn either off permanently via STRIP_BINARIES=0 / REMOVE_LA_FILES=0 in forge.conf.
+
+The repo tarball itself is also compressed at xz -9e (max, slower) rather than the default level, since a cached build is written once but meant to be reused -- size matters more there than build-time speed.
 
      Hooks: right after installing files onto the real system, 'smith'
      checks the manifest it just wrote against FORGE_HOOKS (a table of
@@ -179,7 +164,7 @@ The package's own version (pacman's pkgver from .PKGINFO, or Debian's Version: f
    or .md5sum (just the hash, one line). If present, this takes priority over
    SHA256SUM/MD5SUM set inside the recipe itself.
 
-   probe <pkg|--all> [--update] [-y|--yes]
+### probe <pkg|--all> [--update] [-y|--yes]
      Checks upstream for a newer version, without installing anything.
      Requires a recipe to define:
        VERSION_CHECK_URL="<page listing available versions/tarballs>"
