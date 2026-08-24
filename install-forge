@@ -1,0 +1,17 @@
+#!/bin/bash
+
+if ! [[ $EUID -eq 0 || $UID -eq 0 ]]; then
+	echo "You have to run this command as root."
+	exit -1
+fi
+
+echo -n "Creating Forge directories: "
+mkdir -p /etc/forge/{langs,recipes}
+echo "Done"
+
+echo "Copying Forge executable and langs files: "
+cp forge /bin/forge
+cp langs/*.sh /etc/forge/langs/
+echo "Done"
+
+echo "Installation of Forge Complete!"
