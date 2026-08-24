@@ -1,9 +1,27 @@
 # Forge
-Forge - The Universal Linux Package Manager - lets you install any package from any package repo, from source tarball to well-known package managers like Pacman and APT (still in progress for DNF (aka de Fedora Linux's PM).
+Forge - The Universal Linux Package Manager - lets you install any package from any package repo, from source tarball to well-known package managers like Pacman, APT and DNF.
 
 > [!CAUTION]
 > Do not run "sudo rm -rf /" LOL 😂 
 > (seriously, don't try this, I even gave the wrong command purposely)
+
+# Installation
+
+Clone this repo with the CLI command **git**:
+
+```bash
+git clone https://github.com/johnfg-archbtw/forge
+```
+
+> [!NOTE]
+> If you are quite advanced in Linux, you may notice that there aren't any Makefile nor any compile script, and that's the point, this project is 100% Bash!
+
+Then cd to the forge/ dir, and run the automated installation script, as root:
+
+```bash
+cd forge/
+sudo ./install-forge
+```
 
 # Bit of History of Forge
 
