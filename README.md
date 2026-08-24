@@ -49,7 +49,7 @@ of whiptail, since that's what Termux actually packages.
 
 ## Commands:
    
-### smith:
+### smith
 
    ```
    smith <pkg> [-y|--yes] [-f|--force] [--dry-run] [--clean|--fresh] [--no-cache] [--no-store] [--no-strip] [--keep-la] [--with-<opt>|--without-<opt> ...]
@@ -57,6 +57,7 @@ of whiptail, since that's what Termux actually packages.
    
 Downloads (or, for a GIT_URL recipe, clones), heats (configures),
      molds (builds), and smiths (installs) a package from its recipe (located at /etc/forge/recipes/).
+#### Options
 
 * -y, --yes: skips confirmation prompts. On a fresh install or upgrade, it proceeds automatically; if the same version is already installed, it does nothing (no redundant reinstall). Also answers any OPTIONS prompt with that option's own default.
 * -f, --force: forces a reinstall even if the package is already up to date.
@@ -68,8 +69,8 @@ Downloads (or, for a GIT_URL recipe, clones), heats (configures),
 * --keep-la: keeps libtool .la files instead of deleting them (see "Cleanup" below).
 * --with-<opt>, --without-<opt>: answers  one of the recipe's OPTIONS on the command line instead of being prompted (see OPTIONS below).
 
-
-If heat()/mold() get interrupted (Ctrl+C, closed terminal, power loss) or fail partway through, the extracted source tree is kept as-is instead of being wiped -- running 'forge smith <pkg>' again picks up right where it left off. This is NOT line-by-line resumption inside heat()/mold()/smith() -- Forge only tracks three checkpoints: whether the source is already extracted (or, for a GIT_URL recipe, cloned), whether heat() already finished successfully once, and whether mold() already finished successfully once. Whichever of heat()/mold() didn't finish is rerun from its own start on the next attempt (relying on make/ninja/cargo/x.py and most build systems being incremental by nature to skip what's already done, since their own build directory is preserved too); whichever DID finish is skipped entirely. This only resumes for the SAME version -- if the recipe's VERSION changed since the interrupted attempt, it starts fresh automatically. 
+> ![NOTE]
+> If heat()/mold() get interrupted (Ctrl+C, closed terminal, power loss) or fail partway through, the extracted source tree is kept as-is instead of being wiped -- running 'forge smith <pkg>' again picks up right where it left off. This is NOT line-by-line resumption inside heat()/mold()/smith() -- Forge only tracks three checkpoints: whether the source is already extracted (or, for a GIT_URL recipe, cloned), whether heat() already finished successfully once, and whether mold() already finished successfully once. Whichever of heat()/mold() didn't finish is rerun from its own start on the next attempt (relying on make/ninja/cargo/x.py and most build systems being incremental by nature to skip what's already done, since their own build directory is preserved too); whichever DID finish is skipped entirely. This only resumes for the SAME version -- if the recipe's VERSION changed since the interrupted attempt, it starts fresh automatically. 
 
 Use --clean to discard an in-progress build on purpose (e.g. after editing heat()/mold()/smith(), or if a build got into a bad state) instead of resuming it.
 
