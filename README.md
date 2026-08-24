@@ -47,9 +47,9 @@ CHECKSUM_DIR, WORKDIR, LANG_DIR, INSTALL_ROOT, REPO_DIR, FORGE_HOME sets
 all of the above at once). 'forge menu' also accepts 'dialog' in place
 of whiptail, since that's what Termux actually packages.
 
-Commands:
+## Commands:
    
-   smith:
+### smith:
 
    ```
    smith <pkg> [-y|--yes] [-f|--force] [--dry-run] [--clean|--fresh] [--no-cache] [--no-store] [--no-strip] [--keep-la] [--with-<opt>|--without-<opt> ...]
