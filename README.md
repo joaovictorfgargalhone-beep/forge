@@ -76,34 +76,17 @@ Downloads (or, for a GIT_URL recipe, clones), heats (configures),
 > 
 > This only resumes for the SAME version -- if the recipe's VERSION changed since the interrupted attempt, it starts fresh automatically. 
 
-Use --clean to discard an in-progress build on purpose (e.g. after editing heat()/mold()/smith(), or if a build got into a bad state) instead of resuming it.
+* Use --clean to discard an in-progress build on purpose (e.g. after editing heat()/mold()/smith(), or if a build got into a bad state) instead of resuming it.
 
-A recipe may optionally define finish(), run after the package is copied onto the real filesystem (not the staging directory). Use it for steps that only make sense on the real installed path, such as setcap on the final binary.
+* A recipe may optionally define finish(), run after the package is copied onto the real filesystem (not the staging directory). Use it for steps that only make sense on the real installed path, such as setcap on the final binary.
 
-A recipe defines GIT_URL instead of URL to be sourced via 'git clone' (shallow, --depth 1) rather than a tarball download --see 'sketch --source git' above for the easiest way to generate one. GIT_REF (a tag, branch, or commit) is optional; without it, the repo's default branch HEAD is cloned. Everything else about the package (heat()/mold()/smith(), OPTIONS, caching, the repo) works exactly the same either way -- caching in particular still applies, keyed the same way (recipe content + OPTIONS), so a git-sourced package that takes a while to build still only pays that cost once per config.
+* A recipe defines GIT_URL instead of URL to be sourced via 'git clone' (shallow, --depth 1) rather than a tarball download --see 'sketch --source git' above for the easiest way to generate one. GIT_REF (a tag, branch, or commit) is optional; without it, the repo's default branch HEAD is cloned. Everything else about the package (heat()/mold()/smith(), OPTIONS, caching, the repo) works exactly the same either way -- caching in particular still applies, keyed the same way (recipe content + OPTIONS), so a git-sourced package that takes a while to build still only pays that cost once per config.
 
-A recipe defines PKG_FORMAT ('pacman' or 'deb') alongside a normal
-     URL to install an already-built binary package from another
-     distro's format directly -- Arch's .pkg.tar.zst/.xz or Debian's
-     .deb -- instead of building anything. URL still points at the
-     actual package file (a repo mirror, a local path, wherever); Forge
-     downloads it exactly like any other package, then extracts it
-     itself and stages the real files into PKG_DIR, the same role it
-     always has. heat()/mold()/smith() are NOT called for a PKG_FORMAT
-     recipe -- there's nothing to configure or build, only to unpack --
-     so don't define them (sketch generates a PKG_FORMAT recipe without
-     them; assay doesn't require them either for this case). The
-     package's own version (pacman's pkgver from .PKGINFO, or Debian's
-     Version: from control) is used in place of the recipe's own
-     VERSION whenever the two disagree, since that's the authoritative
-     source. Maintainer scripts (pacman's .INSTALL post_install/
-     post_upgrade, Debian's postinst) are deliberately NOT run --
-     most of what they'd typically do (ldconfig, mandb, desktop/icon/
-     mime caches) is already covered generically by the Hooks system
-     below; 'smith' prints a note when a package had one, so you can
-     check by hand if something package-specific seems to be missing.
-     Everything else (caching, hooks, history, OPTIONS) works the same
-     as any other recipe.
+A recipe defines PKG_FORMAT ('pacman' or 'deb') alongside a normal URL to install an already-built binary package from another distro's format directly -- Arch's .pkg.tar.zst/.xz or Debian's .deb -- instead of building anything. 
+
+URL still points at the actual package file (a repo mirror, a local path, wherever); Forge downloads it exactly like any other package, then extracts it itself and stages the real files into PKG_DIR, the same role it always has. heat()/mold()/smith() are NOT called for a PKG_FORMAT recipe -- there's nothing to configure or build, only to unpack -- so don't define them (sketch generates a PKG_FORMAT recipe without them; assay doesn't require them either for this case).
+
+The package's own version (pacman's pkgver from .PKGINFO, or Debian's Version: from control) is used in place of the recipe's own VERSION whenever the two disagree, since that's the authoritative source. Maintainer scripts (pacman's .INSTALL post_install/post_upgrade, Debian's postinst) are deliberately NOT run -- most of what they'd typically do (ldconfig, mandb, desktop/icon/mime caches) is already covered generically by the Hooks system below; 'smith' prints a note when a package had one, so you can check by hand if something package-specific seems to be missing. Everything else (caching, hooks, history, OPTIONS) works the same as any other recipe.
 
      A recipe may optionally define heat(), run before mold() to handle
      configuration (./configure, meson setup, cmake, autogen.sh) as its
@@ -189,7 +172,7 @@ A recipe defines PKG_FORMAT ('pacman' or 'deb') alongside a normal
      strictly sequential installs instead (easier to read the combined
      output of a big cascade, at the cost of speed).
 
-   assay <pkg>
+### assay <pkg>
      Validates a recipe before you ever smith it: checks NAME/VERSION/URL are set, mold() (build method) or smith() (install method) functions exist, dependecies DEPS have matching recipes, and warns if no checksum SHA256SUM/MD5SUM or CRLF line endings are present.
 
    Checksums can also live outside the recipe, in /etc/forge/checksums/<pkg>.sha256sum
