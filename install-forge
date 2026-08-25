@@ -9,7 +9,7 @@ echo -n "Creating Forge directories: "
 mkdir -p /etc/forge/{langs,recipes}
 echo "Done"
 
-echo "Copying Forge executable and langs files: "
+echo -n "Copying Forge executable and langs files: "
 cp forge /bin/forge
 cp langs/*.sh /etc/forge/langs/
 echo "Done"

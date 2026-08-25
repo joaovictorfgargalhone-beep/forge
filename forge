@@ -131,6 +131,21 @@ PACMAN_REPOS="${PACMAN_REPOS:-core extra multilib}"
 APT_MIRROR="${APT_MIRROR:-https://deb.debian.org/debian}"
 APT_SUITE="${APT_SUITE:-stable}"
 APT_COMPONENTS="${APT_COMPONENTS:-main}"
+
+# Same idea for 'sketch --source dnf' -- Fedora's own direct mirror by
+# default (bypasses the mirrorlist redirector for simplicity, at the
+# cost of being slower than a geographically-close mirror; point
+# DNF_MIRROR at one if you want). Works for any repo using the same
+# createrepo layout (baseurl/repodata/repomd.xml + primary.xml), which
+# covers most RPM-based distros, not just Fedora -- point DNF_MIRROR/
+# FEDORA_RELEASEVER/DNF_REPOS at an RHEL clone or openSUSE's repo
+# layout and it should still work. Unlike pacman/apt, this has no
+# local-cache fast path (see sketch_dnf_lookup for why) -- always
+# fetches repodata fresh.
+DNF_MIRROR="${DNF_MIRROR:-https://dl.fedoraproject.org/pub/fedora/linux/releases}"
+FEDORA_RELEASEVER="${FEDORA_RELEASEVER:-41}"
+DNF_REPOS="${DNF_REPOS:-Everything}"
+DNF_ARCH="${DNF_ARCH:-x86_64}"
 CONFIG_FILE="${FORGE_CONFIG_FILE:-${FORGE_HOME:+$FORGE_HOME/forge.conf}}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/forge/forge.conf}"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
@@ -627,6 +642,7 @@ forge_archive_ext() {
 		*.tar)     echo "tar" ;;
 		*.zip)     echo "zip" ;;
 		*.deb)     echo "deb" ;;
+		*.rpm)     echo "rpm" ;;
 		*) return 1 ;;
 	esac
 }
@@ -776,6 +792,58 @@ forge_install_deb_pkg() {
 	fi
 
 	rm -rf "$extract_dir"
+	[ -n "$version" ] && printf '%s\n' "$version"
+}
+
+# Same idea as forge_install_pacman_pkg/forge_install_deb_pkg, for an
+# RPM package (Fedora/RHEL/openSUSE and derivatives). Extraction prefers
+# 'rpm2cpio | cpio' (the standard pair; rpm2cpio unwraps the RPM header
+# to expose the cpio payload, cpio unpacks that); falls back to
+# 'bsdtar' if that pair isn't available, since libarchive reads RPM
+# payloads natively. Version comes from 'rpm -qp' (the header's own
+# VERSION-RELEASE) when the 'rpm' tool itself is present; otherwise
+# falls back to parsing it straight from the filename, which RPM's own
+# naming convention makes reliable: <name>-<version>-<release>.<arch>.rpm.
+# Same reasoning as the other two formats for NOT running scriptlets
+# (%pre/%post, embedded in the RPM header itself, not a separate file) --
+# prints a note when 'rpm' is available and reports the package has any.
+forge_install_rpm_pkg() {
+	local archive="$1" pkg_dir="$2"
+	mkdir -p "$pkg_dir"
+
+	local version=""
+	if command -v rpm >/dev/null 2>&1; then
+		version=$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$archive" 2>/dev/null)
+		if rpm -qp --scripts "$archive" 2>/dev/null | grep -q .; then
+			echo "Note: this RPM has pre/post scriptlets -- not run automatically. Check it manually (rpm -qp --scripts) if something package-specific seems missing after install." >&2
+		fi
+	fi
+	if [ -z "$version" ]; then
+		local base rel rest ver
+		base=$(basename "$archive")
+		base="${base%.rpm}"
+		base="${base%.*}"
+		rel="${base##*-}"
+		rest="${base%-*}"
+		ver="${rest##*-}"
+		version="${ver}-${rel}"
+	fi
+
+	if command -v rpm2cpio >/dev/null 2>&1 && command -v cpio >/dev/null 2>&1; then
+		if ! (rpm2cpio "$archive" | (cd "$pkg_dir" && cpio -idm --quiet)) 2>/dev/null; then
+			echo "Error: failed to extract RPM package $archive via rpm2cpio/cpio" >&2
+			return 1
+		fi
+	elif command -v bsdtar >/dev/null 2>&1; then
+		if ! bsdtar -xf "$archive" -C "$pkg_dir" 2>/dev/null; then
+			echo "Error: failed to extract RPM package $archive via bsdtar" >&2
+			return 1
+		fi
+	else
+		echo "Error: need either 'rpm2cpio'+'cpio' or 'bsdtar' (libarchive) to extract .rpm packages, neither found." >&2
+		return 1
+	fi
+
 	[ -n "$version" ] && printf '%s\n' "$version"
 }
 
@@ -1892,6 +1960,141 @@ sketch_apt_lookup() {
 	printf '%s\t%s\n' "${APT_MIRROR%/}/${filename}" "$version"
 }
 
+# DNF/RPM repos use XML (repomd.xml + primary.xml), unlike pacman's
+# plain key=value desc files or apt's RFC822 stanzas -- sed/awk can't
+# parse that safely (namespaces, nesting), so these two use python3
+# (already a hard dependency of sketch, same as the HTML scraping
+# elsewhere in this file) via a real XML parser instead of pretending
+# text tools are enough.
+
+# Reads repomd.xml (piped in on stdin) and prints the href of its
+# "primary" metadata file (relative to the repo's own baseurl) -- the
+# file that actually lists every package. Prints nothing on any parse
+# problem or if no primary entry exists.
+sketch_dnf_primary_href() {
+	local script
+	script=$(mktemp)
+	cat > "$script" << 'PYEOF'
+import sys, xml.etree.ElementTree as ET
+ns = {"r": "http://linux.duke.edu/metadata/repo"}
+try:
+	root = ET.fromstring(sys.stdin.read())
+except ET.ParseError:
+	sys.exit(1)
+for data in root.findall("r:data", ns):
+	if data.get("type") == "primary":
+		loc = data.find("r:location", ns)
+		if loc is not None and loc.get("href"):
+			print(loc.get("href"))
+		break
+PYEOF
+	python3 "$script"
+	rm -f "$script"
+}
+
+# Reads a decompressed primary.xml (a file path, $2) for a
+# "<package><name>$1</name>...</package>" entry and prints
+# VERSION<TAB>HREF (ver-rel from the <version> tag's own attributes,
+# href from <location>) on a match, or nothing on a miss or parse
+# problem.
+sketch_dnf_find_in_primary() {
+	local pkg="$1" primary_file="$2"
+	local script
+	script=$(mktemp)
+	cat > "$script" << 'PYEOF'
+import sys, xml.etree.ElementTree as ET
+ns = {"c": "http://linux.duke.edu/metadata/common"}
+want = sys.argv[1]
+try:
+	root = ET.parse(sys.argv[2]).getroot()
+except (ET.ParseError, FileNotFoundError):
+	sys.exit(1)
+for pkg in root.findall("c:package", ns):
+	name = pkg.find("c:name", ns)
+	if name is None or name.text != want:
+		continue
+	ver = pkg.find("c:version", ns)
+	loc = pkg.find("c:location", ns)
+	version = ""
+	if ver is not None:
+		version = "{}-{}".format(ver.get("ver", ""), ver.get("rel", ""))
+	href = loc.get("href") if loc is not None else ""
+	if href:
+		print(version)
+		print(href)
+	break
+PYEOF
+	python3 "$script" "$pkg" "$primary_file"
+	rm -f "$script"
+}
+
+# Shared by sketch_dnf_lookup: fetches repomd.xml from $1 (a repo
+# baseurl -- the directory that directly contains repodata/), follows
+# it to the primary metadata file, decompresses that (.gz/.xz/plain),
+# and scans it for $2. Prints URL<TAB>VERSION on a hit, or nothing (and
+# fails) on any step failing -- bad baseurl, no primary entry, package
+# not in this repo.
+sketch_dnf_scan() {
+	local base_url="$1" pkg="$2"
+	local repomd
+	repomd=$(wget -qO- "${base_url%/}/repodata/repomd.xml" 2>/dev/null)
+	[ -z "$repomd" ] && return 1
+
+	local primary_href
+	primary_href=$(printf '%s' "$repomd" | sketch_dnf_primary_href)
+	[ -z "$primary_href" ] && return 1
+
+	local primary_compressed primary_plain
+	primary_compressed=$(mktemp)
+	if ! wget -qO "$primary_compressed" "${base_url%/}/${primary_href}"; then
+		rm -f "$primary_compressed"
+		return 1
+	fi
+	primary_plain=$(mktemp)
+	case "$primary_href" in
+		*.gz) zcat "$primary_compressed" > "$primary_plain" 2>/dev/null ;;
+		*.xz) xzcat "$primary_compressed" > "$primary_plain" 2>/dev/null ;;
+		*)    cp "$primary_compressed" "$primary_plain" ;;
+	esac
+	rm -f "$primary_compressed"
+
+	local result
+	result=$(sketch_dnf_find_in_primary "$pkg" "$primary_plain")
+	rm -f "$primary_plain"
+	[ -z "$result" ] && return 1
+
+	local version href
+	version=$(printf '%s\n' "$result" | sed -n 1p)
+	href=$(printf '%s\n' "$result" | sed -n 2p)
+	printf '%s\t%s\n' "${base_url%/}/${href}" "$version"
+}
+
+# For '--source dnf' -- resolves $1 (a package name) to a download URL
+# by trying each repo in DNF_REPOS under
+# DNF_MIRROR/FEDORA_RELEASEVER/<repo>/DNF_ARCH/os (forge.conf). No
+# local-cache fast path unlike pacman/apt: dnf/dnf5 cache repodata
+# under a hashed directory name
+# (/var/cache/{dnf,libdnf5}/<reponame>-<hash>/) that doesn't reliably
+# map back to a real baseurl without also parsing /etc/yum.repos.d/*.repo
+# and cross-referencing -- not worth the complexity when fetching
+# repodata fresh is a handful of small XML files anyway. Prints
+# URL<TAB>VERSION, or nothing (and fails) if the package isn't in any
+# configured repo.
+sketch_dnf_lookup() {
+	local pkg="$1"
+	local repo base_url result
+	echo "Checking $DNF_MIRROR directly (no local-cache fast path for dnf -- see sketch_dnf_lookup)..." >&2
+	for repo in $DNF_REPOS; do
+		base_url="${DNF_MIRROR%/}/${FEDORA_RELEASEVER}/${repo}/${DNF_ARCH}/os"
+		result=$(sketch_dnf_scan "$base_url" "$pkg")
+		if [ -n "$result" ]; then
+			printf '%s\n' "$result"
+			return 0
+		fi
+	done
+	return 1
+}
+
 sketch_detect_build_system() {
 	local tarball="$1"
 	local listing
@@ -2343,28 +2546,32 @@ Commands:
      git-sourced package that takes a while to build still only pays
      that cost once per config.
 
-     A recipe defines PKG_FORMAT ('pacman' or 'deb') alongside a normal
-     URL to install an already-built binary package from another
-     distro's format directly -- Arch's .pkg.tar.zst/.xz or Debian's
-     .deb -- instead of building anything. URL still points at the
-     actual package file (a repo mirror, a local path, wherever); Forge
-     downloads it exactly like any other package, then extracts it
-     itself and stages the real files into PKG_DIR, the same role it
-     always has. heat()/mold()/smith() are NOT called for a PKG_FORMAT
-     recipe -- there's nothing to configure or build, only to unpack --
-     so don't define them (sketch generates a PKG_FORMAT recipe without
-     them; assay doesn't require them either for this case). The
-     package's own version (pacman's pkgver from .PKGINFO, or Debian's
-     Version: from control) is used in place of the recipe's own
-     VERSION whenever the two disagree, since that's the authoritative
-     source. Maintainer scripts (pacman's .INSTALL post_install/
-     post_upgrade, Debian's postinst) are deliberately NOT run --
-     most of what they'd typically do (ldconfig, mandb, desktop/icon/
-     mime caches) is already covered generically by the Hooks system
-     below; 'smith' prints a note when a package had one, so you can
-     check by hand if something package-specific seems to be missing.
-     Everything else (caching, hooks, history, OPTIONS) works the same
-     as any other recipe.
+     A recipe defines PKG_FORMAT ('pacman', 'deb', or 'rpm') alongside
+     a normal URL to install an already-built binary package from
+     another distro's format directly -- Arch's .pkg.tar.zst/.xz,
+     Debian's .deb, or an RPM (Fedora/RHEL/openSUSE) -- instead of
+     building anything. URL still points at the actual package file (a
+     repo mirror, a local path, wherever); Forge downloads it exactly
+     like any other package, then extracts it itself and stages the
+     real files into PKG_DIR, the same role it always has.
+     heat()/mold()/smith() are NOT called for a PKG_FORMAT recipe --
+     there's nothing to configure or build, only to unpack -- so don't
+     define them (sketch generates a PKG_FORMAT recipe without them;
+     assay doesn't require them either for this case). The package's
+     own version (pacman's pkgver from .PKGINFO, Debian's Version:
+     from control, or an RPM's own VERSION-RELEASE) is used in place of
+     the recipe's own VERSION whenever the two disagree, since that's
+     the authoritative source. Maintainer scripts (pacman's .INSTALL
+     post_install/post_upgrade, Debian's postinst, an RPM's %pre/%post
+     scriptlets) are deliberately NOT run -- most of what they'd
+     typically do (ldconfig, mandb, desktop/icon/mime caches) is
+     already covered generically by the Hooks system below; 'smith'
+     prints a note when a package had one, so you can check by hand if
+     something package-specific seems to be missing. RPM extraction
+     needs either 'rpm2cpio'+'cpio' or 'bsdtar' (whichever's found
+     first); pacman/deb need only the standard 'tar'/'ar'. Everything
+     else (caching, hooks, history, OPTIONS) works the same as any
+     other recipe.
 
      A recipe may optionally define heat(), run before mold() to handle
      configuration (./configure, meson setup, cmake, autogen.sh) as its
@@ -2474,7 +2681,7 @@ Commands:
      to change, since it's already expected to reference \${VERSION}.
      Does not install anything -- follow up with 'forge temper <pkg>'.
 
-   sketch <pkg> [--source lfs|blfs|slfs|glfs|mlfs|gnome|git|pacman|apt] [-s <source>] [--url <page, tarball, or git repo>] [--ref <tag/branch/commit>] [--category <dir>] [--force]
+   sketch <pkg> [--source lfs|blfs|slfs|glfs|mlfs|gnome|git|pacman|apt|dnf] [-s <source>] [--url <page, tarball, or git repo>] [--ref <tag/branch/commit>] [--category <dir>] [--force]
      Generates a DRAFT recipe by looking up <pkg> in the LFS, BLFS,
      SLFS, GLFS, or MLFS book and scraping its page: download link,
      version, checksum (if listed), any patch or additional-download
@@ -2569,11 +2776,25 @@ Commands:
      with the first "deb " line in /etc/apt/sources.list(.d), or
      APT_MIRROR directly) and falls straight into the PKG_FORMAT
      handling above -- same generated recipe you'd get from
-     'sketch --url' pointed directly at that .pkg.tar.zst/.deb. Since
-     "found nothing" here can still just mean the wrong repos/suite
-     are configured rather than the package not existing, these stay
-     opt-in only (via --source), never part of the default
+     'sketch --url' pointed directly at that .pkg.tar.zst/.deb/.rpm.
+     Since "found nothing" here can still just mean the wrong
+     repos/suite are configured rather than the package not existing,
+     these stay opt-in only (via --source), never part of the default
      multi-source search.
+
+     --source dnf <pkg>: same idea, for Fedora/RHEL/openSUSE-style RPM
+     repos. No local-cache fast path though -- dnf/dnf5 cache repodata
+     under a hashed directory name that doesn't reliably map back to a
+     real baseurl without also parsing /etc/yum.repos.d/*.repo, and
+     that wasn't worth the complexity when fetching repodata fresh is
+     just a couple of small XML files anyway. Always fetches
+     repomd.xml + primary.xml from DNF_MIRROR/FEDORA_RELEASEVER/
+     DNF_REPOS/DNF_ARCH (forge.conf; defaults to Fedora's own direct
+     mirror) and parses those with python3 (a real XML parser, unlike
+     pacman/apt's plain-text formats sed/awk can handle safely) to find
+     the package and its download href. Works against any repo using
+     the same createrepo layout, not just Fedora's -- point DNF_MIRROR
+     at an RHEL clone or openSUSE's repo tree and it should still work.
 
      --category places the recipe under RECIPE_DIR/<dir>/ instead of the
      top level (matching subfolders like python-modules/).
@@ -3044,8 +3265,9 @@ EOF
 			case "$PKG_FORMAT" in
 				pacman) PKG_FORMAT_VERSION=$(forge_install_pacman_pkg "$TARBALL" "$PKG_DIR") ;;
 				deb)    PKG_FORMAT_VERSION=$(forge_install_deb_pkg "$TARBALL" "$PKG_DIR") ;;
+				rpm)    PKG_FORMAT_VERSION=$(forge_install_rpm_pkg "$TARBALL" "$PKG_DIR") ;;
 				*)
-					echo "Error: unknown PKG_FORMAT '$PKG_FORMAT' -- expected 'pacman' or 'deb'."
+					echo "Error: unknown PKG_FORMAT '$PKG_FORMAT' -- expected 'pacman', 'deb', or 'rpm'."
 					exit 1
 					;;
 			esac
@@ -3281,8 +3503,8 @@ EOF
 			echo "	[INFO] GIT_URL is defined; sourced via 'git clone' instead of a tarball download.${GIT_REF:+ Ref: $GIT_REF.}"
 		elif [ -n "$PKG_FORMAT" ]; then
 			case "$PKG_FORMAT" in
-				pacman|deb) echo "	[INFO] PKG_FORMAT=$PKG_FORMAT; URL is downloaded and extracted as a foreign binary package, not built -- heat()/mold()/smith() aren't called for this recipe." ;;
-				*) echo "	[FAIL] PKG_FORMAT='$PKG_FORMAT' isn't recognized -- must be 'pacman' or 'deb'."; ISSUES=$((ISSUES+1)) ;;
+				pacman|deb|rpm) echo "	[INFO] PKG_FORMAT=$PKG_FORMAT; URL is downloaded and extracted as a foreign binary package, not built -- heat()/mold()/smith() aren't called for this recipe." ;;
+				*) echo "	[FAIL] PKG_FORMAT='$PKG_FORMAT' isn't recognized -- must be 'pacman', 'deb', or 'rpm'."; ISSUES=$((ISSUES+1)) ;;
 			esac
 		elif [ -z "$URL" ]; then
 			echo "	[INFO] No URL or GIT_URL defined; treated as a meta-package -- mold()/smith() (if defined) run directly against the real system with no download."
@@ -3446,20 +3668,25 @@ EOF
 			exit 1
 		fi
 
-		if { [ "$SKETCH_BOOK" = "pacman" ] || [ "$SKETCH_BOOK" = "apt" ]; } && [ -z "$SKETCH_URL" ]; then
-			echo "Looking up '$PACKAGE' (local index first, then $([ "$SKETCH_BOOK" = "pacman" ] && echo "$PACMAN_MIRROR" || echo "$APT_MIRROR") if needed)..."
-			if [ "$SKETCH_BOOK" = "pacman" ]; then
-				SK_PM_RESULT=$(sketch_pacman_lookup "$PACKAGE")
-			else
-				SK_PM_RESULT=$(sketch_apt_lookup "$PACKAGE")
-			fi
+		if { [ "$SKETCH_BOOK" = "pacman" ] || [ "$SKETCH_BOOK" = "apt" ] || [ "$SKETCH_BOOK" = "dnf" ]; } && [ -z "$SKETCH_URL" ]; then
+			case "$SKETCH_BOOK" in
+				pacman) SK_PM_MIRROR_DESC="$PACMAN_MIRROR" ;;
+				apt)    SK_PM_MIRROR_DESC="$APT_MIRROR" ;;
+				dnf)    SK_PM_MIRROR_DESC="$DNF_MIRROR" ;;
+			esac
+			echo "Looking up '$PACKAGE' (local index first, then $SK_PM_MIRROR_DESC if needed)..."
+			case "$SKETCH_BOOK" in
+				pacman) SK_PM_RESULT=$(sketch_pacman_lookup "$PACKAGE") ;;
+				apt)    SK_PM_RESULT=$(sketch_apt_lookup "$PACKAGE") ;;
+				dnf)    SK_PM_RESULT=$(sketch_dnf_lookup "$PACKAGE") ;;
+			esac
 			if [ -z "$SK_PM_RESULT" ]; then
 				echo "Error: '$PACKAGE' not found -- checked the local index and the configured mirror."
-				if [ "$SKETCH_BOOK" = "pacman" ]; then
-					echo "Confirm the name is right (pacman is exact-match on %NAME%), or that PACMAN_MIRROR/PACMAN_REPOS (forge.conf) actually carry it."
-				else
-					echo "Confirm the name is right (apt is exact-match on Package:), or that APT_MIRROR/APT_SUITE/APT_COMPONENTS (forge.conf) actually carry it."
-				fi
+				case "$SKETCH_BOOK" in
+					pacman) echo "Confirm the name is right (pacman is exact-match on %NAME%), or that PACMAN_MIRROR/PACMAN_REPOS (forge.conf) actually carry it." ;;
+					apt)    echo "Confirm the name is right (apt is exact-match on Package:), or that APT_MIRROR/APT_SUITE/APT_COMPONENTS (forge.conf) actually carry it." ;;
+					dnf)    echo "Confirm the name is right (dnf is exact-match on <name>), or that DNF_MIRROR/FEDORA_RELEASEVER/DNF_REPOS (forge.conf) actually carry it." ;;
+				esac
 				exit 1
 			fi
 			SKETCH_URL=$(printf '%s' "$SK_PM_RESULT" | cut -f1)
@@ -3476,7 +3703,7 @@ EOF
 					glfs)  SKETCH_BOOKS_TO_TRY=("glfs:$GLFS_BOOK_INDEX_URL") ;;
 					mlfs)  SKETCH_BOOKS_TO_TRY=("mlfs:$MLFS_BOOK_INDEX_URL") ;;
 					gnome) SKETCH_BOOKS_TO_TRY=("gnome:gnome") ;;
-					*) echo "Error: --source must be 'lfs', 'blfs', 'slfs', 'glfs', 'mlfs', 'gnome', 'git' (also needs --url), 'pacman', or 'apt'"; exit 1 ;;
+					*) echo "Error: --source must be 'lfs', 'blfs', 'slfs', 'glfs', 'mlfs', 'gnome', 'git' (also needs --url), 'pacman', 'apt', or 'dnf'"; exit 1 ;;
 				esac
 			else
 				# No --source given: search across all six, in the order
@@ -3537,6 +3764,7 @@ EOF
 		case "$SKETCH_URL" in
 			*.pkg.tar.zst|*.pkg.tar.xz|*.pkg.tar.gz) SKETCH_PKG_FORMAT="pacman" ;;
 			*.deb) SKETCH_PKG_FORMAT="deb" ;;
+			*.rpm) SKETCH_PKG_FORMAT="rpm" ;;
 		esac
 
 		if [ -n "$SKETCH_PKG_FORMAT" ]; then
@@ -3553,6 +3781,7 @@ EOF
 			case "$SKETCH_PKG_FORMAT" in
 				pacman) SK_VERSION=$(forge_install_pacman_pkg "$SK_PEEK_PKG" "$SK_PEEK_DIR") ;;
 				deb)    SK_VERSION=$(forge_install_deb_pkg "$SK_PEEK_PKG" "$SK_PEEK_DIR") ;;
+				rpm)    SK_VERSION=$(forge_install_rpm_pkg "$SK_PEEK_PKG" "$SK_PEEK_DIR") ;;
 			esac
 			rm -rf "$SK_PEEK_PKG" "$SK_PEEK_DIR"
 			if [ -z "$SK_VERSION" ]; then
