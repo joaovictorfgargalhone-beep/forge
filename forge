@@ -141,9 +141,15 @@ APT_COMPONENTS="${APT_COMPONENTS:-main}"
 # FEDORA_RELEASEVER/DNF_REPOS at an RHEL clone or openSUSE's repo
 # layout and it should still work. Unlike pacman/apt, this has no
 # local-cache fast path (see sketch_dnf_lookup for why) -- always
-# fetches repodata fresh.
+# fetches repodata fresh. FEDORA_RELEASEVER left empty (the default)
+# means auto-detect the newest release directory at lookup time
+# instead of a hardcoded number, which would just go stale the same
+# way a fixed version always does -- see sketch_dnf_lookup. Set it
+# explicitly to pin a specific release (or point DNF_MIRROR/DNF_REPOS
+# at a non-Fedora RPM repo where this releases/<ver>/ layout doesn't
+# apply at all).
 DNF_MIRROR="${DNF_MIRROR:-https://dl.fedoraproject.org/pub/fedora/linux/releases}"
-FEDORA_RELEASEVER="${FEDORA_RELEASEVER:-41}"
+FEDORA_RELEASEVER="${FEDORA_RELEASEVER:-}"
 DNF_REPOS="${DNF_REPOS:-Everything}"
 DNF_ARCH="${DNF_ARCH:-x86_64}"
 CONFIG_FILE="${FORGE_CONFIG_FILE:-${FORGE_HOME:+$FORGE_HOME/forge.conf}}"
@@ -1892,15 +1898,25 @@ sketch_apt_scan() {
 	local lists_dir="$1" pkg="$2"
 	[ -d "$lists_dir" ] || return 1
 
-	local pkg_file reader block version filename
+	local pkg_file reader_cmd block version filename
 	for pkg_file in "$lists_dir"/*Packages*; do
 		[ -f "$pkg_file" ] || continue
+		local zst_tool=()
+		command -v unzstd >/dev/null 2>&1 && zst_tool=(unzstd -q -c)
+		[ ${#zst_tool[@]} -eq 0 ] && command -v zstd >/dev/null 2>&1 && zst_tool=(zstd -q -d -c)
 		case "$pkg_file" in
-			*.gz) reader="zcat" ;;
-			*.xz) reader="xzcat" ;;
-			*) reader="cat" ;;
+			*.gz) reader_cmd=(zcat) ;;
+			*.xz) reader_cmd=(xzcat) ;;
+			*.zst)
+				if [ ${#zst_tool[@]} -eq 0 ]; then
+					echo "Warning: $pkg_file is zstd-compressed but neither 'unzstd' nor 'zstd' is on PATH -- skipping it. Install the 'zstd' package." >&2
+					continue
+				fi
+				reader_cmd=("${zst_tool[@]}")
+				;;
+			*) reader_cmd=(cat) ;;
 		esac
-		block=$("$reader" "$pkg_file" 2>/dev/null | awk -v want="$pkg" '
+		block=$("${reader_cmd[@]}" "$pkg_file" 2>/dev/null | awk -v want="$pkg" '
 			BEGIN { RS = ""; FS = "\n" }
 			{
 				name = ""; ver = ""; fn = ""
@@ -2052,8 +2068,19 @@ sketch_dnf_scan() {
 	fi
 	primary_plain=$(mktemp)
 	case "$primary_href" in
-		*.gz) zcat "$primary_compressed" > "$primary_plain" 2>/dev/null ;;
-		*.xz) xzcat "$primary_compressed" > "$primary_plain" 2>/dev/null ;;
+		*.gz)  zcat "$primary_compressed" > "$primary_plain" 2>/dev/null ;;
+		*.xz)  xzcat "$primary_compressed" > "$primary_plain" 2>/dev/null ;;
+		*.zst)
+			if command -v unzstd >/dev/null 2>&1; then
+				unzstd -q -c "$primary_compressed" > "$primary_plain" 2>/dev/null
+			elif command -v zstd >/dev/null 2>&1; then
+				zstd -q -d -c "$primary_compressed" > "$primary_plain" 2>/dev/null
+			else
+				echo "Error: primary metadata is zstd-compressed (.zst) but neither 'unzstd' nor 'zstd' is on PATH -- this is createrepo_c's default since 1.0, so most current Fedora/RPM repos need one of these. Install the 'zstd' package." >&2
+				rm -f "$primary_compressed" "$primary_plain"
+				return 1
+			fi
+			;;
 		*)    cp "$primary_compressed" "$primary_plain" ;;
 	esac
 	rm -f "$primary_compressed"
@@ -2071,7 +2098,13 @@ sketch_dnf_scan() {
 
 # For '--source dnf' -- resolves $1 (a package name) to a download URL
 # by trying each repo in DNF_REPOS under
-# DNF_MIRROR/FEDORA_RELEASEVER/<repo>/DNF_ARCH/os (forge.conf). No
+# DNF_MIRROR/<releasever>/<repo>/DNF_ARCH/os (forge.conf). When
+# FEDORA_RELEASEVER isn't set, auto-detects the newest release by
+# listing DNF_MIRROR's own directory index and picking the
+# highest-numbered entry (sort -V, same approach as
+# sketch_gnome_lookup's series detection) -- a hardcoded version
+# number would just go stale the moment Fedora cuts the next release,
+# same problem a fixed GNOME series or pacman tag would have. No
 # local-cache fast path unlike pacman/apt: dnf/dnf5 cache repodata
 # under a hashed directory name
 # (/var/cache/{dnf,libdnf5}/<reponame>-<hash>/) that doesn't reliably
@@ -2079,13 +2112,26 @@ sketch_dnf_scan() {
 # and cross-referencing -- not worth the complexity when fetching
 # repodata fresh is a handful of small XML files anyway. Prints
 # URL<TAB>VERSION, or nothing (and fails) if the package isn't in any
-# configured repo.
+# configured repo, or no release directory could be found/guessed at all.
 sketch_dnf_lookup() {
 	local pkg="$1"
 	local repo base_url result
+
+	local releasever="$FEDORA_RELEASEVER"
+	if [ -z "$releasever" ]; then
+		releasever=$(wget -qO- "${DNF_MIRROR%/}/" 2>/dev/null \
+			| grep -oP 'href\s*=\s*"\K[0-9]+(?=/")' \
+			| sort -Vu | tail -n1)
+		if [ -z "$releasever" ]; then
+			echo "Error: couldn't auto-detect the newest Fedora release under $DNF_MIRROR -- set FEDORA_RELEASEVER explicitly in forge.conf." >&2
+			return 1
+		fi
+		echo "Auto-detected Fedora release: $releasever (set FEDORA_RELEASEVER in forge.conf to pin a specific one)" >&2
+	fi
+
 	echo "Checking $DNF_MIRROR directly (no local-cache fast path for dnf -- see sketch_dnf_lookup)..." >&2
 	for repo in $DNF_REPOS; do
-		base_url="${DNF_MIRROR%/}/${FEDORA_RELEASEVER}/${repo}/${DNF_ARCH}/os"
+		base_url="${DNF_MIRROR%/}/${releasever}/${repo}/${DNF_ARCH}/os"
 		result=$(sketch_dnf_scan "$base_url" "$pkg")
 		if [ -n "$result" ]; then
 			printf '%s\n' "$result"
